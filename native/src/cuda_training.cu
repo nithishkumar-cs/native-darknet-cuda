@@ -8,15 +8,20 @@
 #include "avgpool_cuda.cuh"
 #ifdef DETECTOR_HAS_CUDNN
 #include "detector/cudnn_backend.hpp"
+#else
+#include "im2col_cuda.cuh"
 #endif
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <exception>
 #include <future>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -102,6 +107,40 @@ struct DeviceMemory {
 #endif
 };
 
+/** Page-locked host staging buffer, so minibatch uploads run as DMA without a pageable bounce. */
+struct PinnedBuffer {
+    float* data = nullptr;
+    std::size_t capacity = 0;
+    PinnedBuffer() = default;
+    PinnedBuffer(const PinnedBuffer&) = delete;
+    PinnedBuffer& operator=(const PinnedBuffer&) = delete;
+    ~PinnedBuffer() { if (data) cudaFreeHost(data); }
+    /** Grows the buffer to at least `count` floats; existing contents are not preserved. */
+    void reserve(std::size_t count) {
+        if (count <= capacity) return;
+        if (data) cudaFreeHost(data);
+        data = nullptr;
+        capacity = 0;
+        check(cudaHostAlloc(reinterpret_cast<void**>(&data), count * sizeof(float), cudaHostAllocPortable),
+              "cudaHostAlloc");
+        capacity = count;
+    }
+};
+
+/** Runs work(t) for t in [0, workers) on `workers` threads and rethrows the first failure. */
+template <typename Work>
+void parallel_for_workers(std::size_t workers, Work&& work) {
+    std::vector<std::exception_ptr> errors(workers);
+    auto guarded = [&](std::size_t t) {
+        try { work(t); } catch (...) { errors[t] = std::current_exception(); }
+    };
+    std::vector<std::thread> pool;
+    for (std::size_t t = 1; t < workers; ++t) pool.emplace_back(guarded, t);
+    guarded(0);
+    for (auto& thread : pool) thread.join();
+    for (const auto& error : errors) if (error) std::rethrow_exception(error);
+}
+
 #ifndef DETECTOR_HAS_CUDNN
 constexpr float kBnEps = 1e-5f;
 #endif
@@ -111,24 +150,23 @@ constexpr int kReductionTile = 4096;
 #endif
 inline int blocks_for(int count) { return count > 0 ? (count + kThreads - 1) / kThreads : 1; }
 
-#ifdef DETECTOR_HAS_CUDNN
-/** Applies bias and leaky activation to cuDNN's raw convolution output. */
-__global__ void convolution_bias_activation(const float* raw, const float* bias,
-                                             float* preactivation, float* output,
-                                             int count, int plane, int channels, bool leaky) {
+// Activations are applied in place and no pre-activation copy is kept: leaky ReLU (slope 0.1)
+// preserves the sign, so backward recovers its derivative from the activated output (see
+// activation_backward). This drops one minibatch-sized buffer per convolution/shortcut layer.
+
+/** Adds bias and applies the activation in place to a minibatch's raw convolution output. */
+__global__ void bias_activation(float* values, const float* bias, int count, int plane, int channels, bool leaky) {
     int pos = blockIdx.x * blockDim.x + threadIdx.x;
     if (pos >= count) return;
-    float value = raw[pos] + bias[(pos / plane) % channels];
-    preactivation[pos] = value;
-    output[pos] = leaky && value < 0 ? value * 0.1f : value;
+    float value = values[pos] + bias[(pos / plane) % channels];
+    values[pos] = leaky && value < 0 ? value * 0.1f : value;
 }
 
-/** Applies the activation after cuDNN's batch-normalization affine transform. */
-__global__ void batch_norm_activation(const float* preactivation, float* output, int count, bool leaky) {
+#ifdef DETECTOR_HAS_CUDNN
+/** Applies the activation in place after cuDNN's batch-normalization affine transform. */
+__global__ void activate_in_place(float* values, int count, bool leaky) {
     int pos = blockIdx.x * blockDim.x + threadIdx.x;
-    if (pos >= count) return;
-    float value = preactivation[pos];
-    output[pos] = leaky && value < 0 ? value * 0.1f : value;
+    if (pos < count && leaky && values[pos] < 0) values[pos] *= 0.1f;
 }
 
 /** Recovers biased batch variance from cuDNN's saved inverse standard deviation. */
@@ -140,20 +178,6 @@ __global__ void inverse_variance_to_variance(const float* inverse, float* varian
 #endif
 
 #ifndef DETECTOR_HAS_CUDNN
-/** Expands one CHW image into a position-major matrix for cuBLAS convolutions. */
-__global__ void convolution_im2col(const float* input, float* columns, int channels, int ih, int iw,
-                                   int oh, int ow, int kernel, int stride, int pad) {
-    int pos = blockIdx.x * blockDim.x + threadIdx.x;
-    int plane = oh * ow;
-    int count = channels * kernel * kernel * plane;
-    if (pos >= count) return;
-    int pixel = pos % plane;
-    int key = pos / plane;
-    int kx = key % kernel, ky = key / kernel % kernel, ic = key / (kernel * kernel);
-    int iy = pixel / ow * stride + ky - pad, ix = pixel % ow * stride + kx - pad;
-    columns[pos] = iy >= 0 && ix >= 0 && iy < ih && ix < iw
-        ? input[(static_cast<std::size_t>(ic) * ih + iy) * iw + ix] : 0.0f;
-}
 
 /** Gathers the column gradient into each input pixel without contended atomics. */
 __global__ void convolution_col2im_add(const float* columns, float* previous_gradient,
@@ -176,36 +200,19 @@ __global__ void convolution_col2im_add(const float* columns, float* previous_gra
     previous_gradient[pos] += sum;
 }
 
-__global__ void convolution_forward_plain(const float* input, const float* weights, const float* bias,
-                                          float* preactivation, float* output, int channels, int ih, int iw,
-                                          int filters, int oh, int ow, int kernel, int stride, int pad, bool leaky) {
-    int pos = blockIdx.x * blockDim.x + threadIdx.x;
-    if (pos >= filters * oh * ow) return;
-    int ox = pos % ow, oy = pos / ow % oh, oc = pos / (ow * oh);
-    float value = bias[oc];
-    for (int ic = 0; ic < channels; ++ic)
-        for (int ky = 0; ky < kernel; ++ky)
-            for (int kx = 0; kx < kernel; ++kx) {
-                int iy = oy * stride + ky - pad, ix = ox * stride + kx - pad;
-                if (iy < 0 || ix < 0 || iy >= ih || ix >= iw) continue;
-                std::size_t wi = ((static_cast<std::size_t>(oc) * channels + ic) * kernel + ky) * kernel + kx;
-                value += weights[wi] * input[(static_cast<std::size_t>(ic) * ih + iy) * iw + ix];
-            }
-    preactivation[pos] = value;
-    output[pos] = leaky && value < 0 ? value * 0.1f : value;
-}
-
 /** Reduces one sample/channel tile in parallel for batch mean and variance. */
 __global__ void batch_norm_statistics_partial(const float* raw, double* partial, int filters,
                                               int plane, int sample_stride, int chunks) {
     int chunk = blockIdx.x, oc = blockIdx.y, sample = blockIdx.z;
     int start = chunk * kReductionTile, end = min(start + kReductionTile, plane);
     const float* channel = raw + static_cast<std::size_t>(sample) * sample_stride + static_cast<std::size_t>(oc) * plane;
-    double sum = 0.0, square = 0.0;
+    // Each thread folds at most kReductionTile / kThreads (16) values in fp32; only the cross-thread
+    // and cross-tile sums use fp64, which keeps the per-element work off GeForce's slow fp64 units.
+    float sum = 0.0f, square = 0.0f;
     for (int p = start + threadIdx.x; p < end; p += blockDim.x) {
-        double value = channel[p];
+        float value = channel[p];
         sum += value;
-        square += value * value;
+        square = fmaf(value, value, square);
     }
     __shared__ double sums[kThreads], squares[kThreads];
     sums[threadIdx.x] = sum;
@@ -243,16 +250,16 @@ __global__ void batch_norm_statistics_finish(const double* partial, float* mean,
     variance[oc] = static_cast<float>(fmax(0.0, square / count - m * m));
 }
 
+/** Normalizes, scales/shifts and activates a whole minibatch's raw convolution output. */
 __global__ void batch_norm_apply(const float* raw, const float* mean, const float* variance,
-                                 const float* gamma, const float* beta, float* preactivation,
-                                 float* output, int count, int plane, bool leaky) {
+                                 const float* gamma, const float* beta, float* output,
+                                 int count, int plane, int channels, bool leaky) {
     int pos = blockIdx.x * blockDim.x + threadIdx.x;
     if (pos >= count) return;
-    int oc = pos / plane;
+    int oc = (pos / plane) % channels;
     float inv_std = 1.0f / sqrtf(variance[oc] + kBnEps);
     float xhat = (raw[pos] - mean[oc]) * inv_std;
     float value = gamma[oc] * xhat + beta[oc];
-    preactivation[pos] = value;
     output[pos] = leaky && value < 0 ? value * 0.1f : value;
 }
 #endif
@@ -292,12 +299,11 @@ __global__ void upsample_forward(const float* input, float* output, int channels
     output[pos] = input[(static_cast<std::size_t>(c) * ih + y / stride) * iw + x / stride];
 }
 
-__global__ void shortcut_forward(const float* previous, const float* branch, float* preactivation,
-                                 float* output, int count, bool leaky) {
+/** Residual add plus activation over a whole minibatch. */
+__global__ void shortcut_forward(const float* previous, const float* branch, float* output, int count, bool leaky) {
     int pos = blockIdx.x * blockDim.x + threadIdx.x;
     if (pos >= count) return;
     float value = previous[pos] + branch[pos];
-    preactivation[pos] = value;
     output[pos] = leaky && value < 0 ? value * 0.1f : value;
 }
 
@@ -354,9 +360,10 @@ __global__ void dropout_backward(const float* gradient, const float* scale, floa
     previous_gradient[pos] += gradient[pos] * scale[pos];
 }
 
-__global__ void activation_backward(float* gradient, const float* preactivation, int count, bool leaky) {
+/** Leaky-ReLU backward from the activated output: leaky(x) < 0 exactly when x < 0. */
+__global__ void activation_backward(float* gradient, const float* output, int count, bool leaky) {
     int pos = blockIdx.x * blockDim.x + threadIdx.x;
-    if (pos < count && leaky && preactivation[pos] < 0) gradient[pos] *= 0.1f;
+    if (pos < count && leaky && output[pos] < 0) gradient[pos] *= 0.1f;
 }
 
 #ifndef DETECTOR_HAS_CUDNN
@@ -368,7 +375,9 @@ __global__ void batch_norm_backward_partial(const float* g, const float* raw, co
     const float* gc = g + static_cast<std::size_t>(sample) * sample_stride + static_cast<std::size_t>(oc) * plane;
     const float* rc = raw + static_cast<std::size_t>(sample) * sample_stride + static_cast<std::size_t>(oc) * plane;
     float inv_std = 1.0f / sqrtf(variance[oc] + kBnEps);
-    double sd = 0.0, sdx = 0.0, dgamma = 0.0, dbeta = 0.0;
+    // fp32 per-thread partials over at most 16 values; fp64 only across threads/tiles (see
+    // batch_norm_statistics_partial).
+    float sd = 0.0f, sdx = 0.0f, dgamma = 0.0f, dbeta = 0.0f;
     for (int p = start + threadIdx.x; p < end; p += blockDim.x) {
         float xhat = (rc[p] - mean[oc]) * inv_std;
         float dxhat = gc[p] * gamma[oc];
@@ -422,10 +431,10 @@ __global__ void batch_norm_backward_finish(const double* partial, float* sum_dxh
 __global__ void batch_norm_backward_dz(float* g, const float* raw, const float* mean,
                                        const float* variance, const float* gamma,
                                        const float* sum_dxhat, const float* sum_dxhat_xhat,
-                                       int count, int plane, int total_n) {
+                                       int count, int plane, int channels, int total_n) {
     int pos = blockIdx.x * blockDim.x + threadIdx.x;
     if (pos >= count) return;
-    int oc = pos / plane;
+    int oc = (pos / plane) % channels;
     float inv_std = 1.0f / sqrtf(variance[oc] + kBnEps);
     float xhat = (raw[pos] - mean[oc]) * inv_std;
     float dxhat = g[pos] * gamma[oc];
@@ -433,13 +442,16 @@ __global__ void batch_norm_backward_dz(float* g, const float* raw, const float* 
 }
 #endif
 
-__global__ void bias_grad_reduce(const float* dz, float* bias_grad_accum, int filters, int plane) {
+/** Accumulates each filter's bias gradient over all n samples' planes (sample-major blocks). */
+__global__ void bias_grad_reduce(const float* dz, float* bias_grad_accum, int filters, int plane, int n) {
     int oc = blockIdx.x * blockDim.x + threadIdx.x;
     if (oc >= filters) return;
-    const float* dc = dz + static_cast<std::size_t>(oc) * plane;
-    float sum = 0;
-    for (int p = 0; p < plane; ++p) sum += dc[p];
-    bias_grad_accum[oc] += sum;
+    for (int s = 0; s < n; ++s) {
+        const float* dc = dz + (static_cast<std::size_t>(s) * filters + oc) * plane;
+        float sum = 0;
+        for (int p = 0; p < plane; ++p) sum += dc[p];
+        bias_grad_accum[oc] += sum;
+    }
 }
 
 __global__ void max_pool_backward(const float* gradient, const int* index, float* previous_gradient, int count) {
@@ -470,6 +482,12 @@ __global__ void shortcut_backward(const float* gradient, float* previous_gradien
 __global__ void add_into(float* dst, const float* src, int count) {
     int pos = blockIdx.x * blockDim.x + threadIdx.x;
     if (pos < count) dst[pos] += src[pos];
+}
+
+/** Route backward for a whole minibatch: dst holds `width` floats per sample, src `src_stride`. */
+__global__ void add_strided_into(float* dst, const float* src, int width, int src_stride, int count) {
+    int pos = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pos < count) dst[pos] += src[static_cast<std::size_t>(pos / width) * src_stride + pos % width];
 }
 
 // Classic SGD momentum: velocity = momentum*velocity + this step's averaged gradient (plus
@@ -518,7 +536,18 @@ struct CudaTrainer::Impl {
     std::size_t bn_partial_capacity = 1;
     double* bn_partial = nullptr;
 #endif
-    float* input = nullptr;
+    float* input = nullptr;  // device input slot of the step being enqueued (one of device_inputs)
+    // Two input slots and staging buffers let the next minibatch's host staging and upload (on
+    // copy_stream) overlap the previous step's backward pass, which step() does not wait for.
+    float* device_inputs[2] = {nullptr, nullptr};
+    PinnedBuffer host_inputs[2];
+    cudaStream_t copy_stream = nullptr;
+    cudaEvent_t input_copied[2] = {nullptr, nullptr};  // upload from host_inputs[slot] finished
+    cudaEvent_t step_done[2] = {nullptr, nullptr};     // last step that read device_inputs[slot] finished
+    int input_slot = 0;
+    // Host copies of every YOLO/region head for a whole minibatch (sample-major), reused per step.
+    std::vector<std::vector<float>> host_heads, host_head_gradients;
+    // `preactivation` is per-layer state only for dropout (mask) and normalization layers.
     std::vector<float*> output, preactivation, gradient;
     std::vector<float*> raw, batch_mean, batch_var, sum_dxhat, running_mean, running_variance;
 #ifndef DETECTOR_HAS_CUDNN
@@ -531,6 +560,9 @@ struct CudaTrainer::Impl {
 #ifdef DETECTOR_HAS_CUDNN
     std::vector<std::unique_ptr<CudnnConvolution>> cudnn_convolutions;
     std::vector<std::unique_ptr<CudnnBatchNorm>> cudnn_batch_norms;
+    // One minibatch-sized buffer shared by every layer's cuDNN batch-norm backward output.
+    std::size_t bn_scratch_capacity = 1;
+    float* bn_scratch = nullptr;
 #endif
 
     /** Initializes parameters, spatial buffers, and a full-precision matrix multiplication handle. */
@@ -565,7 +597,8 @@ struct CudaTrainer::Impl {
         // laid out contiguously (sample-major) so a true minibatch's cross-sample batch-norm
         // statistics (and every other per-sample forward/backward op) can run within one step().
         const auto batch_elems = static_cast<std::size_t>(batch);
-        input = memory.floats(batch_elems * net.input_shape().elements());
+        for (float*& slot : device_inputs) slot = memory.floats(batch_elems * net.input_shape().elements());
+        input = device_inputs[0];
         std::size_t n = layers.size();
         output.resize(n); preactivation.resize(n, nullptr); gradient.resize(n);
         raw.resize(n, nullptr); batch_mean.resize(n, nullptr); batch_var.resize(n, nullptr);
@@ -587,13 +620,9 @@ struct CudaTrainer::Impl {
             output[i] = memory.floats(batch_elems * layer.output.elements());
             gradient[i] = memory.floats(batch_elems * layer.output.elements());
             if (layer.kind == Kind::maxpool) { max_index[i] = memory.ints(batch_elems * layer.output.elements()); continue; }
-            // Dropout reuses the shortcut-style `preactivation` slot to stash each element's
-            // per-step 0/keep_scale draw, so backward replays the exact mask forward drew.
-            if (layer.kind == Kind::shortcut || layer.kind == Kind::dropout) {
-                preactivation[i] = memory.floats(batch_elems * layer.output.elements());
-                continue;
-            }
-            if (layer.kind == Kind::normalization) {
+            // Dropout uses the `preactivation` slot to stash each element's per-step 0/keep_scale
+            // draw, so backward replays the exact mask forward drew.
+            if (layer.kind == Kind::dropout || layer.kind == Kind::normalization) {
                 preactivation[i] = memory.floats(batch_elems * layer.output.elements());
                 continue;
             }
@@ -624,7 +653,6 @@ struct CudaTrainer::Impl {
                 continue;
             }
             if (layer.kind != Kind::convolutional) continue;
-            preactivation[i] = memory.floats(batch_elems * layer.output.elements());
             std::size_t fan_in = static_cast<std::size_t>(layer.input.c) * layer.size * layer.size;
 #ifndef DETECTOR_HAS_CUDNN
             column_capacity = std::max(column_capacity, fan_in * static_cast<std::size_t>(layer.output.h) * layer.output.w);
@@ -647,6 +675,7 @@ struct CudaTrainer::Impl {
 #else
                 cudnn_batch_norms[i] = std::make_unique<CudnnBatchNorm>(layer.output.c,
                     layer.output.h, layer.output.w);
+                bn_scratch_capacity = std::max(bn_scratch_capacity, batch_elems * layer.output.elements());
 #endif
                 if (layer.scales.size() != static_cast<std::size_t>(layer.output.c) ||
                     layer.means.size() != static_cast<std::size_t>(layer.output.c) ||
@@ -672,12 +701,58 @@ struct CudaTrainer::Impl {
         bn_partial = memory.doubles(bn_partial_capacity);
         check(cublasCreate(&blas), "cublasCreate");
         check(cublasSetMathMode(blas, CUBLAS_PEDANTIC_MATH), "cublasSetMathMode");
+#else
+        bn_scratch = memory.floats(bn_scratch_capacity);
+#endif
+        // Non-blocking so uploads are not serialized against the legacy default stream that every
+        // kernel, cuBLAS and cuDNN call here uses.
+        check(cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking), "cudaStreamCreate copy");
+        for (int slot = 0; slot < 2; ++slot) {
+            check(cudaEventCreateWithFlags(&input_copied[slot], cudaEventDisableTiming), "cudaEventCreate input");
+            check(cudaEventCreateWithFlags(&step_done[slot], cudaEventDisableTiming), "cudaEventCreate step");
+        }
+    }
+
+    /** Waits for in-flight steps, then releases the upload stream, events and cuBLAS handle
+     *  before the tracked device allocations are freed. */
+    ~Impl() {
+        cudaDeviceSynchronize();
+        for (int slot = 0; slot < 2; ++slot) {
+            if (input_copied[slot]) cudaEventDestroy(input_copied[slot]);
+            if (step_done[slot]) cudaEventDestroy(step_done[slot]);
+        }
+        if (copy_stream) cudaStreamDestroy(copy_stream);
+#ifndef DETECTOR_HAS_CUDNN
+        if (blas) cublasDestroy(blas);
 #endif
     }
 
 #ifndef DETECTOR_HAS_CUDNN
-    /** Releases the matrix multiplication handle before tracked CUDA allocations. */
-    ~Impl() { if (blas) cublasDestroy(blas); }
+    /** True when a convolution's CHW input already is its im2col matrix (1x1, stride 1, no pad). */
+    static bool pointwise(const Layer& layer) { return layer.size == 1 && layer.stride == 1 && layer.padding == 0; }
+
+    /** Writes each of n samples' raw (bias-free) convolution into sample-major `destination`
+     *  via im2col + SGEMM; pointwise layers feed their input to SGEMM directly. */
+    void convolution_forward(const Layer& layer, const float* source, std::size_t source_stride,
+                             const float* layer_weights, float* destination, std::size_t n) {
+        const float one = 1.0f, zero_beta = 0.0f;
+        const int plane = layer.output.h * layer.output.w;
+        const int key_count = layer.input.c * layer.size * layer.size;
+        const std::size_t elems = layer.output.elements();
+        for (std::size_t s = 0; s < n; ++s) {
+            const float* matrix = source + s * source_stride;
+            if (!pointwise(layer)) {
+                im2col_kernel<<<blocks_for(key_count * plane), kThreads>>>(matrix, columns,
+                    layer.input.c, layer.input.h, layer.input.w, layer.output.h, layer.output.w,
+                    layer.size, layer.stride, layer.padding);
+                launch_check();
+                matrix = columns;
+            }
+            check(cublasSgemm(blas, CUBLAS_OP_N, CUBLAS_OP_N, plane, layer.output.c, key_count,
+                              &one, matrix, plane, layer_weights, key_count, &zero_beta, destination + s * elems, plane),
+                  "cublasSgemm forward");
+        }
+    }
 #endif
 
     // Darknet-style multiscale resize: recomputes every layer's shape on `network` for a new
@@ -689,12 +764,17 @@ struct CudaTrainer::Impl {
     // like Darknet's own resize_network, unlike a destroy-and-reconstruct approach would.
     /** Resizes spatial buffers while preserving learned parameters and optimizer state. */
     void resize(int width, int height) {
+        check(cudaDeviceSynchronize(), "cudaDeviceSynchronize before resize");  // in-flight steps use these buffers
         network.resize(width, height);
         const auto& layers = network.layers();
-        memory.replace(input, static_cast<std::size_t>(batch_size) * network.input_shape().elements());
+        for (float*& slot : device_inputs)
+            memory.replace(slot, static_cast<std::size_t>(batch_size) * network.input_shape().elements());
+        input = device_inputs[input_slot];
 #ifndef DETECTOR_HAS_CUDNN
         column_capacity = 1;
         bn_partial_capacity = 1;
+#else
+        bn_scratch_capacity = 1;
 #endif
         for (std::size_t i = 0; i < layers.size(); ++i) {
             const auto& layer = layers[i];
@@ -702,20 +782,23 @@ struct CudaTrainer::Impl {
             memory.replace(output[i], elems);
             memory.replace(gradient[i], elems);
             if (layer.kind == Kind::maxpool) { memory.replace(max_index[i], elems); continue; }
-            if (layer.kind == Kind::shortcut || layer.kind == Kind::dropout ||
-                layer.kind == Kind::normalization) { memory.replace(preactivation[i], elems); continue; }
+            if (layer.kind == Kind::dropout || layer.kind == Kind::normalization) {
+                memory.replace(preactivation[i], elems);
+                continue;
+            }
             if (layer.kind != Kind::convolutional) continue;
 #ifdef DETECTOR_HAS_CUDNN
             cudnn_convolutions[i] = std::make_unique<CudnnConvolution>(layer.input.c, layer.input.h,
                 layer.input.w, layer.output.c, layer.size, layer.stride, layer.padding);
-            if (layer.batch_normalize)
+            if (layer.batch_normalize) {
                 cudnn_batch_norms[i] = std::make_unique<CudnnBatchNorm>(layer.output.c,
                     layer.output.h, layer.output.w);
+                bn_scratch_capacity = std::max(bn_scratch_capacity, elems);
+            }
 #else
             column_capacity = std::max(column_capacity, static_cast<std::size_t>(layer.input.c) * layer.size * layer.size *
                                                        layer.output.h * layer.output.w);
 #endif
-            memory.replace(preactivation[i], elems);
             if (layer.batch_normalize) {
                 memory.replace(raw[i], elems);
 #ifndef DETECTOR_HAS_CUDNN
@@ -729,6 +812,8 @@ struct CudaTrainer::Impl {
         memory.replace(columns, column_capacity);
         memory.replace(column_gradient, column_capacity);
         memory.replace(bn_partial, bn_partial_capacity);
+#else
+        memory.replace(bn_scratch, bn_scratch_capacity);
 #endif
     }
 
@@ -745,11 +830,30 @@ struct CudaTrainer::Impl {
 #ifndef DETECTOR_HAS_CUDNN
         const float one = 1.0f, zero_beta = 0.0f;
 #endif
-        for (std::size_t s = 0; s < n; ++s) {
-            if (inputs[s].size() != input_elems) throw std::runtime_error("training input shape mismatch");
-            check(cudaMemcpy(input + s * input_elems, inputs[s].data(), input_elems * sizeof(float), cudaMemcpyHostToDevice),
-                  "cudaMemcpy training input");
-        }
+        // Stage the minibatch in page-locked memory (parallel host copies) and upload it with one
+        // DMA on copy_stream into this step's input slot. step() returns without waiting for its
+        // backward pass, so this staging and upload overlap the previous step's GPU work: the
+        // upload waits (on the GPU) only for the step two calls ago that last read this slot, and
+        // the host waits only for that slot's previous upload before reusing its staging buffer.
+        for (const auto& sample : inputs)
+            if (sample.size() != input_elems) throw std::runtime_error("training input shape mismatch");
+        const int slot = input_slot;
+        input_slot ^= 1;
+        input = device_inputs[slot];
+        PinnedBuffer& staging = host_inputs[slot];
+        check(cudaEventSynchronize(input_copied[slot]), "cudaEventSynchronize staging");
+        const std::size_t host_workers = std::max<std::size_t>(1,
+            std::min<std::size_t>(n, std::min(8u, std::max(1u, std::thread::hardware_concurrency()))));
+        staging.reserve(n * input_elems);
+        parallel_for_workers(host_workers, [&](std::size_t t) {
+            for (std::size_t s = t; s < n; s += host_workers)
+                std::memcpy(staging.data + s * input_elems, inputs[s].data(), input_elems * sizeof(float));
+        });
+        check(cudaStreamWaitEvent(copy_stream, step_done[slot], 0), "cudaStreamWaitEvent input slot");
+        check(cudaMemcpyAsync(input, staging.data, n * input_elems * sizeof(float), cudaMemcpyHostToDevice,
+                              copy_stream), "cudaMemcpyAsync training input");
+        check(cudaEventRecord(input_copied[slot], copy_stream), "cudaEventRecord input");
+        check(cudaStreamWaitEvent(cudaStreamLegacy, input_copied[slot], 0), "cudaStreamWaitEvent input");
 
         // Forward: layer-major so every sample reaches a batch_normalize layer's raw pre-BN conv
         // output before that layer's true batch statistics (computed over all n samples) are
@@ -767,25 +871,16 @@ struct CudaTrainer::Impl {
                 if (layer.batch_normalize) {
 #ifdef DETECTOR_HAS_CUDNN
                     cudnn_convolutions[i]->forward(previous_of(0), weights[i], raw[i], static_cast<int>(n));
-                    cudnn_batch_norms[i]->forward(raw[i], scales[i], biases[i], preactivation[i],
+                    cudnn_batch_norms[i]->forward(raw[i], scales[i], biases[i], output[i],
                         running_mean[i], running_variance[i], batch_mean[i], sum_dxhat[i], static_cast<int>(n));
                     inverse_variance_to_variance<<<blocks_for(layer.output.c), kThreads>>>(
                         sum_dxhat[i], batch_var[i], layer.output.c);
                     launch_check();
-                    batch_norm_activation<<<blocks_for(static_cast<int>(n * elems)), kThreads>>>(
-                        preactivation[i], output[i], static_cast<int>(n * elems), layer.leaky);
+                    activate_in_place<<<blocks_for(static_cast<int>(n * elems)), kThreads>>>(
+                        output[i], static_cast<int>(n * elems), layer.leaky);
                     launch_check();
 #else
-                    int key_count = layer.input.c * layer.size * layer.size;
-                    for (std::size_t s = 0; s < n; ++s) {
-                        convolution_im2col<<<blocks_for(key_count * plane), kThreads>>>(previous_of(s), columns,
-                            layer.input.c, layer.input.h, layer.input.w, layer.output.h, layer.output.w,
-                            layer.size, layer.stride, layer.padding);
-                        launch_check();
-                        check(cublasSgemm(blas, CUBLAS_OP_N, CUBLAS_OP_N, plane, layer.output.c, key_count,
-                                          &one, columns, plane, weights[i], key_count, &zero_beta, raw[i] + s * elems, plane),
-                              "cublasSgemm forward");
-                    }
+                    convolution_forward(layer, previous_of(0), prev_elems, weights[i], raw[i], n);
                     int chunks = (plane + kReductionTile - 1) / kReductionTile;
                     dim3 grid(chunks, layer.output.c, static_cast<unsigned int>(n));
                     batch_norm_statistics_partial<<<grid, kThreads>>>(raw[i], bn_partial,
@@ -794,64 +889,55 @@ struct CudaTrainer::Impl {
                     batch_norm_statistics_finish<<<blocks_for(layer.output.c), kThreads>>>(bn_partial,
                         batch_mean[i], batch_var[i], layer.output.c, plane, static_cast<int>(n), chunks);
                     launch_check();
-                    for (std::size_t s = 0; s < n; ++s) {
-                        batch_norm_apply<<<blocks_for(elements), kThreads>>>(raw[i] + s * elems, batch_mean[i], batch_var[i],
-                            scales[i], biases[i], preactivation[i] + s * elems, output[i] + s * elems, elements, plane, layer.leaky);
-                        launch_check();
-                    }
+                    batch_norm_apply<<<blocks_for(static_cast<int>(n * elems)), kThreads>>>(raw[i], batch_mean[i],
+                        batch_var[i], scales[i], biases[i], output[i], static_cast<int>(n * elems),
+                        plane, layer.output.c, layer.leaky);
+                    launch_check();
 #endif
                     update_running_stats<<<blocks_for(layer.output.c), kThreads>>>(running_mean[i], running_variance[i],
                         batch_mean[i], batch_var[i], layer.output.c, bn_momentum);
                     launch_check();
                 } else {
 #ifdef DETECTOR_HAS_CUDNN
-                    cudnn_convolutions[i]->forward(previous_of(0), weights[i], preactivation[i], static_cast<int>(n));
-                    convolution_bias_activation<<<blocks_for(static_cast<int>(n * elems)), kThreads>>>(
-                        preactivation[i], biases[i], preactivation[i], output[i],
-                        static_cast<int>(n * elems), plane, layer.output.c, layer.leaky);
-                    launch_check();
+                    cudnn_convolutions[i]->forward(previous_of(0), weights[i], output[i], static_cast<int>(n));
 #else
-                    for (std::size_t s = 0; s < n; ++s) {
-                        convolution_forward_plain<<<blocks_for(elements), kThreads>>>(previous_of(s), weights[i], biases[i],
-                            preactivation[i] + s * elems, output[i] + s * elems, layer.input.c, layer.input.h, layer.input.w,
-                            layer.output.c, layer.output.h, layer.output.w, layer.size, layer.stride, layer.padding, layer.leaky);
-                        launch_check();
-                    }
+                    convolution_forward(layer, previous_of(0), prev_elems, weights[i], output[i], n);
 #endif
+                    bias_activation<<<blocks_for(static_cast<int>(n * elems)), kThreads>>>(
+                        output[i], biases[i], static_cast<int>(n * elems), plane, layer.output.c, layer.leaky);
+                    launch_check();
                 }
             } else if (layer.kind == Kind::maxpool) {
-                for (std::size_t s = 0; s < n; ++s) {
-                    max_pool_forward<<<blocks_for(elements), kThreads>>>(previous_of(s), output[i] + s * elems, max_index[i] + s * elems,
-                        layer.input.c, layer.input.h, layer.input.w, layer.output.h, layer.output.w, layer.size, layer.stride);
-                    launch_check();
-                }
+                // Sample-major blocks make n samples of C channels look like one sample of n*C
+                // channels, so one launch covers the minibatch; indices are minibatch-global.
+                max_pool_forward<<<blocks_for(static_cast<int>(n * elems)), kThreads>>>(previous_of(0), output[i],
+                    max_index[i], static_cast<int>(n) * layer.input.c, layer.input.h, layer.input.w,
+                    layer.output.h, layer.output.w, layer.size, layer.stride);
+                launch_check();
             } else if (layer.kind == Kind::avgpool) {
                 avgpool_forward_kernel<<<static_cast<int>(n) * layer.input.c, kThreads>>>(
                     previous_of(0), output[i], layer.input.c, layer.input.h * layer.input.w);
                 launch_check();
             } else if (layer.kind == Kind::route) {
-                for (std::size_t s = 0; s < n; ++s) {
-                    std::size_t offset = 0;
-                    for (int source : layer.sources) {
-                        std::size_t count = layers[static_cast<std::size_t>(source)].output.elements();
-                        check(cudaMemcpy(output[i] + s * elems + offset, output[static_cast<std::size_t>(source)] + s * count,
-                                         count * sizeof(float), cudaMemcpyDeviceToDevice), "cudaMemcpy route");
-                        offset += count;
-                    }
+                // One strided 2D copy per source places that branch in every sample's block.
+                std::size_t offset = 0;
+                for (int source : layer.sources) {
+                    std::size_t count = layers[static_cast<std::size_t>(source)].output.elements();
+                    check(cudaMemcpy2DAsync(output[i] + offset, elems * sizeof(float),
+                                            output[static_cast<std::size_t>(source)], count * sizeof(float),
+                                            count * sizeof(float), n, cudaMemcpyDeviceToDevice), "cudaMemcpy2DAsync route");
+                    offset += count;
                 }
             } else if (layer.kind == Kind::upsample) {
-                for (std::size_t s = 0; s < n; ++s) {
-                    upsample_forward<<<blocks_for(elements), kThreads>>>(previous_of(s), output[i] + s * elems, layer.input.c,
-                        layer.input.h, layer.input.w, layer.output.h, layer.output.w, layer.stride);
-                    launch_check();
-                }
+                upsample_forward<<<blocks_for(static_cast<int>(n * elems)), kThreads>>>(previous_of(0), output[i],
+                    static_cast<int>(n) * layer.input.c, layer.input.h, layer.input.w, layer.output.h, layer.output.w,
+                    layer.stride);
+                launch_check();
             } else if (layer.kind == Kind::shortcut) {
                 std::size_t source = static_cast<std::size_t>(layer.sources.front());
-                for (std::size_t s = 0; s < n; ++s) {
-                    shortcut_forward<<<blocks_for(elements), kThreads>>>(previous_of(s), output[source] + s * elems,
-                        preactivation[i] + s * elems, output[i] + s * elems, elements, layer.leaky);
-                    launch_check();
-                }
+                shortcut_forward<<<blocks_for(static_cast<int>(n * elems)), kThreads>>>(previous_of(0), output[source],
+                    output[i], static_cast<int>(n * elems), layer.leaky);
+                launch_check();
             } else if (layer.kind == Kind::dropout) {
                 float keep_scale = 1.0f / (1.0f - layer.dropout_probability);
                 for (std::size_t s = 0; s < n; ++s) {
@@ -885,15 +971,12 @@ struct CudaTrainer::Impl {
                     layer.norm_alpha, layer.norm_beta, layer.norm_kappa);
                 launch_check();
             } else if (layer.kind == Kind::reorg) {
-                for (std::size_t s = 0; s < n; ++s) {
-                    reorg_forward_kernel<<<blocks_for(elements), kThreads>>>(previous_of(s), output[i] + s * elems,
-                        layer.input.c, layer.input.h, layer.input.w, layer.stride);
-                    launch_check();
-                }
+                reorg_forward_kernel<<<blocks_for(static_cast<int>(n * elems)), kThreads>>>(previous_of(0), output[i],
+                    static_cast<int>(n) * layer.input.c, layer.input.h, layer.input.w, layer.stride);
+                launch_check();
             } else {  // yolo/region: pass-through, matching the CPU trainer's forward for terminal heads.
-                for (std::size_t s = 0; s < n; ++s)
-                    check(cudaMemcpy(output[i] + s * elems, previous_of(s), elems * sizeof(float),
-                                     cudaMemcpyDeviceToDevice), "cudaMemcpy yolo forward");
+                check(cudaMemcpyAsync(output[i], previous_of(0), n * elems * sizeof(float), cudaMemcpyDeviceToDevice),
+                      "cudaMemcpyAsync yolo forward");
             }
         }
 
@@ -905,30 +988,47 @@ struct CudaTrainer::Impl {
             launch_check();
         }
 
-        // YOLO loss: shared host-side assignment/gradient (identical math to the CPU trainer),
-        // computed per sample on only the small head tensors downloaded here.
+        // YOLO loss: shared host-side assignment/gradient (identical math to the CPU trainer) on
+        // only the small head tensors. Each head is downloaded and its gradient uploaded once for
+        // the whole minibatch; samples are independent, so their losses run on worker threads and
+        // are summed afterwards in sample order (same float result as a serial loop).
+        std::vector<std::size_t> heads;
+        for (std::size_t i = 0; i < layers.size(); ++i)
+            if (layers[i].kind == Kind::yolo || layers[i].kind == Kind::region) heads.push_back(i);
+        host_heads.resize(layers.size());
+        host_head_gradients.resize(layers.size());
+        for (std::size_t i : heads) {
+            std::size_t count = n * layers[i].output.elements();
+            host_heads[i].resize(count);
+            host_head_gradients[i].assign(count, 0.0f);
+            check(cudaMemcpy(host_heads[i].data(), output[i], count * sizeof(float), cudaMemcpyDeviceToHost),
+                  "cudaMemcpy yolo output");
+        }
+        std::vector<YoloLossResult> sample_losses(n);
+        parallel_for_workers(host_workers, [&](std::size_t t) {
+            std::vector<std::vector<float>> sample_output(layers.size()), sample_gradient(layers.size());
+            for (std::size_t s = t; s < n; s += host_workers) {
+                for (std::size_t i : heads) {
+                    std::size_t elems = layers[i].output.elements();
+                    const float* begin = host_heads[i].data() + s * elems;
+                    sample_output[i].assign(begin, begin + elems);
+                    sample_gradient[i].assign(elems, 0.0f);
+                }
+                sample_losses[s] = yolo_loss_and_gradient(network, targets[s], sample_output, sample_gradient);
+                for (std::size_t i : heads)
+                    std::copy(sample_gradient[i].begin(), sample_gradient[i].end(),
+                              host_head_gradients[i].begin() + static_cast<std::ptrdiff_t>(s * layers[i].output.elements()));
+            }
+        });
         float total_loss = 0;
         std::size_t total_positives = 0;
-        std::vector<std::vector<float>> host_output(layers.size()), host_gradient(layers.size());
-        for (std::size_t s = 0; s < n; ++s) {
-            for (std::size_t i = 0; i < layers.size(); ++i) {
-                if (layers[i].kind != Kind::yolo && layers[i].kind != Kind::region) continue;
-                std::size_t elems = layers[i].output.elements();
-                host_output[i].resize(elems);
-                check(cudaMemcpy(host_output[i].data(), output[i] + s * elems, elems * sizeof(float), cudaMemcpyDeviceToHost),
-                      "cudaMemcpy yolo output");
-                host_gradient[i].assign(elems, 0.0f);
-            }
-            auto loss_result = yolo_loss_and_gradient(network, targets[s], host_output, host_gradient);
-            total_loss += loss_result.loss;
-            total_positives += loss_result.positives;
-            for (std::size_t i = 0; i < layers.size(); ++i) {
-                if (layers[i].kind != Kind::yolo && layers[i].kind != Kind::region) continue;
-                std::size_t elems = layers[i].output.elements();
-                check(cudaMemcpy(gradient[i] + s * elems, host_gradient[i].data(), elems * sizeof(float),
-                                 cudaMemcpyHostToDevice), "cudaMemcpy yolo gradient");
-            }
+        for (const auto& result : sample_losses) {
+            total_loss += result.loss;
+            total_positives += result.positives;
         }
+        for (std::size_t i : heads)
+            check(cudaMemcpy(gradient[i], host_head_gradients[i].data(), host_head_gradients[i].size() * sizeof(float),
+                             cudaMemcpyHostToDevice), "cudaMemcpy yolo gradient");
 
         // Backward: traverse layers in reverse; each kernel accumulates into its predecessor(s),
         // since sequential launches on one stream see each other's prior writes.
@@ -941,47 +1041,44 @@ struct CudaTrainer::Impl {
                 return (reverse ? output[reverse - 1] : input) + s * prev_elems;
             };
             auto prev_grad_of = [&](std::size_t s) -> float* { return gradient[reverse - 1] + s * prev_elems; };
+            const int batch_count = static_cast<int>(n * elems);
             if (layer.kind == Kind::yolo || layer.kind == Kind::region) {
-                if (reverse)
-                    for (std::size_t s = 0; s < n; ++s) {
-                        add_into<<<blocks_for(elements), kThreads>>>(prev_grad_of(s), gradient[reverse] + s * elems, elements);
-                        launch_check();
-                    }
+                if (reverse) {
+                    add_into<<<blocks_for(batch_count), kThreads>>>(prev_grad_of(0), gradient[reverse], batch_count);
+                    launch_check();
+                }
             } else if (layer.kind == Kind::route) {
-                for (std::size_t s = 0; s < n; ++s) {
-                    std::size_t offset = 0;
-                    for (int source : layer.sources) {
-                        int count = static_cast<int>(layers[static_cast<std::size_t>(source)].output.elements());
-                        add_into<<<blocks_for(count), kThreads>>>(gradient[static_cast<std::size_t>(source)] + s * static_cast<std::size_t>(count),
-                            gradient[reverse] + s * elems + offset, count);
-                        launch_check();
-                        offset += static_cast<std::size_t>(count);
-                    }
+                std::size_t offset = 0;
+                for (int source : layer.sources) {
+                    int count = static_cast<int>(layers[static_cast<std::size_t>(source)].output.elements());
+                    add_strided_into<<<blocks_for(static_cast<int>(n) * count), kThreads>>>(
+                        gradient[static_cast<std::size_t>(source)], gradient[reverse] + offset, count,
+                        static_cast<int>(elems), static_cast<int>(n) * count);
+                    launch_check();
+                    offset += static_cast<std::size_t>(count);
                 }
             } else if (layer.kind == Kind::upsample) {
-                if (reverse)
-                    for (std::size_t s = 0; s < n; ++s) {
-                        upsample_backward<<<blocks_for(elements), kThreads>>>(gradient[reverse] + s * elems, prev_grad_of(s),
-                            layer.input.c, layer.input.h, layer.input.w, layer.output.h, layer.output.w, layer.stride);
-                        launch_check();
-                    }
+                if (reverse) {
+                    upsample_backward<<<blocks_for(batch_count), kThreads>>>(gradient[reverse], prev_grad_of(0),
+                        static_cast<int>(n) * layer.input.c, layer.input.h, layer.input.w, layer.output.h,
+                        layer.output.w, layer.stride);
+                    launch_check();
+                }
             } else if (layer.kind == Kind::shortcut) {
                 if (!reverse) throw std::runtime_error("shortcut cannot be the first layer");
                 std::size_t source = static_cast<std::size_t>(layer.sources.front());
-                for (std::size_t s = 0; s < n; ++s) {
-                    float* grad = gradient[reverse] + s * elems;
-                    activation_backward<<<blocks_for(elements), kThreads>>>(grad, preactivation[reverse] + s * elems, elements, layer.leaky);
-                    launch_check();
-                    shortcut_backward<<<blocks_for(elements), kThreads>>>(grad, prev_grad_of(s), gradient[source] + s * elems, elements);
+                activation_backward<<<blocks_for(batch_count), kThreads>>>(gradient[reverse], output[reverse],
+                    batch_count, layer.leaky);
+                launch_check();
+                shortcut_backward<<<blocks_for(batch_count), kThreads>>>(gradient[reverse], prev_grad_of(0),
+                    gradient[source], batch_count);
+                launch_check();
+            } else if (layer.kind == Kind::maxpool) {
+                if (reverse) {
+                    max_pool_backward<<<blocks_for(batch_count), kThreads>>>(gradient[reverse], max_index[reverse],
+                        prev_grad_of(0), batch_count);
                     launch_check();
                 }
-            } else if (layer.kind == Kind::maxpool) {
-                if (reverse)
-                    for (std::size_t s = 0; s < n; ++s) {
-                        max_pool_backward<<<blocks_for(elements), kThreads>>>(gradient[reverse] + s * elems, max_index[reverse] + s * elems,
-                            prev_grad_of(s), elements);
-                        launch_check();
-                    }
             } else if (layer.kind == Kind::avgpool) {
                 if (reverse) {
                     const int spatial = layer.input.h * layer.input.w;
@@ -1057,26 +1154,23 @@ struct CudaTrainer::Impl {
                     launch_check();
                 }
             } else if (layer.kind == Kind::reorg) {
-                if (reverse)
-                    for (std::size_t s = 0; s < n; ++s) {
-                        reorg_backward_kernel<<<blocks_for(elements), kThreads>>>(gradient[reverse] + s * elems, prev_grad_of(s),
-                            layer.input.c, layer.input.h, layer.input.w, layer.stride);
-                        launch_check();
-                    }
-            } else {  // convolutional
-                int plane = layer.output.h * layer.output.w;
-                for (std::size_t s = 0; s < n; ++s) {
-                    activation_backward<<<blocks_for(elements), kThreads>>>(gradient[reverse] + s * elems,
-                        preactivation[reverse] + s * elems, elements, layer.leaky);
+                if (reverse) {
+                    reorg_backward_kernel<<<blocks_for(batch_count), kThreads>>>(gradient[reverse], prev_grad_of(0),
+                        static_cast<int>(n) * layer.input.c, layer.input.h, layer.input.w, layer.stride);
                     launch_check();
                 }
+            } else {  // convolutional
+                int plane = layer.output.h * layer.output.w;
+                activation_backward<<<blocks_for(batch_count), kThreads>>>(gradient[reverse], output[reverse],
+                    batch_count, layer.leaky);
+                launch_check();
                 if (layer.batch_normalize) {
 #ifdef DETECTOR_HAS_CUDNN
                     cudnn_batch_norms[reverse]->backward(raw[reverse], gradient[reverse], scales[reverse],
-                        batch_mean[reverse], sum_dxhat[reverse], preactivation[reverse],
+                        batch_mean[reverse], sum_dxhat[reverse], bn_scratch,
                         scale_grad_accum[reverse], bias_grad_accum[reverse], static_cast<int>(n));
-                    check(cudaMemcpy(gradient[reverse], preactivation[reverse], n * elems * sizeof(float),
-                                     cudaMemcpyDeviceToDevice), "cudaMemcpy cuDNN BN gradient");
+                    check(cudaMemcpyAsync(gradient[reverse], bn_scratch, n * elems * sizeof(float),
+                                          cudaMemcpyDeviceToDevice), "cudaMemcpyAsync cuDNN BN gradient");
 #else
                     int chunks = (plane + kReductionTile - 1) / kReductionTile;
                     dim3 grid(chunks, layer.output.c, static_cast<unsigned int>(n));
@@ -1088,20 +1182,15 @@ struct CudaTrainer::Impl {
                         sum_dxhat[reverse], sum_dxhat_xhat[reverse], scale_grad_accum[reverse],
                         bias_grad_accum[reverse], layer.output.c, static_cast<int>(n), chunks);
                     launch_check();
-                    int total_n = static_cast<int>(n) * plane;
-                    for (std::size_t s = 0; s < n; ++s) {
-                        batch_norm_backward_dz<<<blocks_for(elements), kThreads>>>(gradient[reverse] + s * elems, raw[reverse] + s * elems,
-                            batch_mean[reverse], batch_var[reverse], scales[reverse], sum_dxhat[reverse], sum_dxhat_xhat[reverse],
-                            elements, plane, total_n);
-                        launch_check();
-                    }
+                    batch_norm_backward_dz<<<blocks_for(batch_count), kThreads>>>(gradient[reverse], raw[reverse],
+                        batch_mean[reverse], batch_var[reverse], scales[reverse], sum_dxhat[reverse],
+                        sum_dxhat_xhat[reverse], batch_count, plane, layer.output.c, static_cast<int>(n) * plane);
+                    launch_check();
 #endif
                 } else {
-                    for (std::size_t s = 0; s < n; ++s) {
-                        bias_grad_reduce<<<blocks_for(layer.output.c), kThreads>>>(gradient[reverse] + s * elems, bias_grad_accum[reverse],
-                            layer.output.c, plane);
-                        launch_check();
-                    }
+                    bias_grad_reduce<<<blocks_for(layer.output.c), kThreads>>>(gradient[reverse], bias_grad_accum[reverse],
+                        layer.output.c, plane, static_cast<int>(n));
+                    launch_check();
                 }
 #ifdef DETECTOR_HAS_CUDNN
                 cudnn_convolutions[reverse]->backward_filter(previous_of(0), gradient[reverse],
@@ -1110,24 +1199,35 @@ struct CudaTrainer::Impl {
                     cudnn_convolutions[reverse]->backward_data(weights[reverse], gradient[reverse],
                         prev_grad_of(0), static_cast<int>(n));
 #else
+                const bool direct = pointwise(layer);
+                int key_count = layer.input.c * layer.size * layer.size;
                 for (std::size_t s = 0; s < n; ++s) {
-                    int key_count = layer.input.c * layer.size * layer.size;
-                    convolution_im2col<<<blocks_for(key_count * plane), kThreads>>>(previous_of(s), columns,
-                        layer.input.c, layer.input.h, layer.input.w, layer.output.h, layer.output.w,
-                        layer.size, layer.stride, layer.padding);
-                    launch_check();
+                    const float* matrix = previous_of(s);
+                    if (!direct) {
+                        im2col_kernel<<<blocks_for(key_count * plane), kThreads>>>(previous_of(s), columns,
+                            layer.input.c, layer.input.h, layer.input.w, layer.output.h, layer.output.w,
+                            layer.size, layer.stride, layer.padding);
+                        launch_check();
+                        matrix = columns;
+                    }
                     check(cublasSgemm(blas, CUBLAS_OP_T, CUBLAS_OP_N, key_count, layer.output.c, plane,
-                                      &one, columns, plane, gradient[reverse] + s * elems, plane,
+                                      &one, matrix, plane, gradient[reverse] + s * elems, plane,
                                       &one, weight_grad_accum[reverse], key_count), "cublasSgemm weight gradient");
-                    if (reverse) {
+                    if (!reverse) continue;
+                    if (direct) {
+                        // The column gradient of a pointwise convolution is the input gradient itself.
                         check(cublasSgemm(blas, CUBLAS_OP_N, CUBLAS_OP_T, plane, key_count, layer.output.c,
                                           &one, gradient[reverse] + s * elems, plane, weights[reverse], key_count,
-                                          &zero_beta, column_gradient, plane), "cublasSgemm input gradient");
-                        convolution_col2im_add<<<blocks_for(static_cast<int>(layer.input.elements())), kThreads>>>(
-                            column_gradient, prev_grad_of(s), layer.input.c, layer.input.h, layer.input.w,
-                            layer.output.h, layer.output.w, layer.size, layer.stride, layer.padding);
-                        launch_check();
+                                          &one, prev_grad_of(s), plane), "cublasSgemm input gradient");
+                        continue;
                     }
+                    check(cublasSgemm(blas, CUBLAS_OP_N, CUBLAS_OP_T, plane, key_count, layer.output.c,
+                                      &one, gradient[reverse] + s * elems, plane, weights[reverse], key_count,
+                                      &zero_beta, column_gradient, plane), "cublasSgemm input gradient");
+                    convolution_col2im_add<<<blocks_for(static_cast<int>(layer.input.elements())), kThreads>>>(
+                        column_gradient, prev_grad_of(s), layer.input.c, layer.input.h, layer.input.w,
+                        layer.output.h, layer.output.w, layer.size, layer.stride, layer.padding);
+                    launch_check();
                 }
 #endif
             }
@@ -1175,7 +1275,9 @@ struct CudaTrainer::Impl {
             }
         }
         ++iteration;
-        check(cudaDeviceSynchronize(), "cudaDeviceSynchronize training");
+        // No device sync: the loss is already on the host, and the next step()'s head download
+        // (or sync_to_network/resize) orders after this backward pass on the same stream.
+        check(cudaEventRecord(step_done[slot], cudaStreamLegacy), "cudaEventRecord step");
         if (!std::isfinite(total_loss)) throw std::runtime_error("non-finite CUDA training loss");
         return {total_loss, total_positives};
     }
@@ -1204,7 +1306,10 @@ struct CudaTrainer::Impl {
         return result;
     }
 
+    /** Waits for in-flight steps (surfacing any asynchronous kernel error), then copies learned
+     *  parameters and BN running statistics back into `network`. */
     void sync_to_network() {
+        check(cudaDeviceSynchronize(), "cudaDeviceSynchronize training");
         const auto& layers = network.layers();
         for (std::size_t i = 0; i < layers.size(); ++i) {
             if (layers[i].kind != Kind::convolutional && layers[i].kind != Kind::local &&

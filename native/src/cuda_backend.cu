@@ -7,8 +7,12 @@
 #include "avgpool_cuda.cuh"
 #ifdef DETECTOR_HAS_CUDNN
 #include "detector/cudnn_backend.hpp"
+#else
+#include "im2col_cuda.cuh"
+#include <cublas_v2.h>
 #endif
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <cmath>
 #include <memory>
 #include <stdexcept>
@@ -21,6 +25,13 @@ namespace {
 void check(cudaError_t result, const char* operation) {
     if (result != cudaSuccess) throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(result));
 }
+
+#ifndef DETECTOR_HAS_CUDNN
+/** Raises an exception when a cuBLAS operation fails. */
+void check(cublasStatus_t status, const char* operation) {
+    if (status != CUBLAS_STATUS_SUCCESS) throw std::runtime_error(std::string(operation) + " failed: " + std::to_string(status));
+}
+#endif
 
 struct DeviceMemory {
     std::vector<void*> allocations;
@@ -38,33 +49,8 @@ struct DeviceMemory {
     }
 };
 
-#ifndef DETECTOR_HAS_CUDNN
-__global__ void convolution(const float* input, const float* weights, const float* multiplier,
-                            const float* offset, float* output, int icount, int ih, int iw,
-                            int ocount, int oh, int ow, int kernel, int stride, int pad, bool leaky) {
-    int pos = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = ocount * oh * ow;
-    if (pos >= total) return;
-    int x = pos % ow;
-    int y = pos / ow % oh;
-    int oc = pos / (ow * oh);
-    float sum = 0;
-    for (int ic = 0; ic < icount; ++ic)
-        for (int ky = 0; ky < kernel; ++ky)
-            for (int kx = 0; kx < kernel; ++kx) {
-                int iy = y * stride + ky - pad;
-                int ix = x * stride + kx - pad;
-                if (iy < 0 || ix < 0 || iy >= ih || ix >= iw) continue;
-                std::size_t wi = ((static_cast<std::size_t>(oc) * icount + ic) * kernel + ky) * kernel + kx;
-                sum += input[(static_cast<std::size_t>(ic) * ih + iy) * iw + ix] * weights[wi];
-            }
-    float value = sum * multiplier[oc] + offset[oc];
-    output[pos] = leaky && value < 0 ? value * 0.1f : value;
-}
-#endif
-
-#ifdef DETECTOR_HAS_CUDNN
-/** Applies the same BN affine transform and activation after cuDNN's raw convolution. */
+/** Applies the folded BN affine transform (or bias) and activation after a raw convolution,
+ *  in one pass instead of separate normalize/scale/bias/activate kernels. */
 __global__ void convolution_epilogue(float* values, const float* multiplier, const float* offset,
                                     int count, int plane, bool leaky) {
     int pos = blockIdx.x * blockDim.x + threadIdx.x;
@@ -73,7 +59,6 @@ __global__ void convolution_epilogue(float* values, const float* multiplier, con
     float value = values[pos] * multiplier[channel] + offset[channel];
     values[pos] = leaky && value < 0 ? value * 0.1f : value;
 }
-#endif
 
 __global__ void max_pool(const float* input, float* output, int channels, int ih, int iw,
                          int oh, int ow, int kernel, int stride) {
@@ -160,9 +145,12 @@ struct CudaSession::Impl {
     std::vector<ConvolutionParameters> parameters;
 #ifdef DETECTOR_HAS_CUDNN
     std::vector<std::unique_ptr<CudnnConvolution>> cudnn_convolutions;
+#else
+    cublasHandle_t blas = nullptr;
+    float* columns = nullptr;  // im2col scratch shared by every non-pointwise convolution
 #endif
 
-    /** Uploads graph buffers and, when enabled, prepares cuDNN contexts. */
+    /** Uploads graph buffers and prepares the cuDNN contexts or the cuBLAS handle and im2col scratch. */
     explicit Impl(const Network& net) : network(net) {
         int devices = 0;
         check(cudaGetDeviceCount(&devices), "cudaGetDeviceCount");
@@ -204,7 +192,25 @@ struct CudaSession::Impl {
                     layer.input.w, layer.output.c, layer.size, layer.stride, layer.padding);
 #endif
         }
+#ifndef DETECTOR_HAS_CUDNN
+        std::size_t column_capacity = 1;
+        for (const auto& layer : layers)
+            if (layer.kind == Kind::convolutional && !pointwise(layer))
+                column_capacity = std::max(column_capacity, static_cast<std::size_t>(layer.input.c) * layer.size *
+                                                            layer.size * layer.output.h * layer.output.w);
+        columns = memory.floats(column_capacity);
+        check(cublasCreate(&blas), "cublasCreate");
+        check(cublasSetMathMode(blas, CUBLAS_PEDANTIC_MATH), "cublasSetMathMode");
+#endif
     }
+
+#ifndef DETECTOR_HAS_CUDNN
+    /** Releases the cuBLAS handle; device buffers are freed by `memory`. */
+    ~Impl() { if (blas) cublasDestroy(blas); }
+
+    /** True when a convolution's CHW input already is its im2col matrix (1x1, stride 1, no pad). */
+    static bool pointwise(const Layer& layer) { return layer.size == 1 && layer.stride == 1 && layer.padding == 0; }
+#endif
 
     /** Runs one input through the graph and downloads detection, classification, or plain terminal heads. */
     std::vector<Head> forward(const std::vector<float>& host_input) {
@@ -236,15 +242,27 @@ struct CudaSession::Impl {
                 launch_check();
             } else if (layer.kind == Kind::convolutional) {
                 const auto& param = parameters[index];
+                const int plane = layer.output.h * layer.output.w;
 #ifdef DETECTOR_HAS_CUDNN
                 cudnn_convolutions[index]->forward(previous, param.weights, result);
-                convolution_epilogue<<<blocks, threads>>>(result, param.scales, param.offsets,
-                    elements, layer.output.h * layer.output.w, layer.leaky);
 #else
-                convolution<<<blocks, threads>>>(previous, param.weights, param.scales, param.offsets, result,
-                    layer.input.c, layer.input.h, layer.input.w, layer.output.c, layer.output.h,
-                    layer.output.w, layer.size, layer.stride, layer.padding, layer.leaky);
+                // Darknet's GPU path: im2col + SGEMM (pointwise layers multiply the input directly).
+                const int key_count = layer.input.c * layer.size * layer.size;
+                const float* matrix = previous;
+                if (!pointwise(layer)) {
+                    im2col_kernel<<<(key_count * plane + threads - 1) / threads, threads>>>(previous, columns,
+                        layer.input.c, layer.input.h, layer.input.w, layer.output.h, layer.output.w,
+                        layer.size, layer.stride, layer.padding);
+                    launch_check();
+                    matrix = columns;
+                }
+                const float one = 1.0f, zero = 0.0f;
+                check(cublasSgemm(blas, CUBLAS_OP_N, CUBLAS_OP_N, plane, layer.output.c, key_count,
+                                  &one, matrix, plane, param.weights, key_count, &zero, result, plane),
+                      "cublasSgemm convolution");
 #endif
+                convolution_epilogue<<<blocks, threads>>>(result, param.scales, param.offsets,
+                    elements, plane, layer.leaky);
                 launch_check();
             } else if (layer.kind == Kind::maxpool) {
                 max_pool<<<blocks, threads>>>(previous, result, layer.input.c, layer.input.h,

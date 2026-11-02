@@ -335,6 +335,20 @@ int main() {
 
         check_parity_resize((directory / "mini.cfg").string(), 3, "resize_mid_training");
 
+        // The CUDA trainer launches maxpool/upsample/reorg/route/shortcut/BN kernels once per
+        // minibatch over sample-major blocks: three distinct samples through every such layer
+        // kind (plus im2col 3x3, strided and pointwise convolutions) must still match the CPU.
+        const auto graph_cfg = (directory / "batch-graph-train.cfg").string();
+        const std::size_t graph_elements = detector::Network::from_cfg(graph_cfg).input_shape().elements();
+        std::vector<std::pair<std::vector<float>, std::vector<detector::Target>>> graph_batch;
+        for (int sample = 0; sample < 3; ++sample) {
+            std::vector<float> values(graph_elements);
+            for (std::size_t i = 0; i < values.size(); ++i)
+                values[i] = 0.05f + 0.9f * static_cast<float>((i * (3 + 2 * sample) + 5 * sample) % 17) / 17.0f;
+            graph_batch.push_back({values, {{0, 0.3f + 0.2f * sample, 0.6f - 0.1f * sample, 0.3f, 0.4f}}});
+        }
+        check_parity_batch(graph_cfg, graph_batch, 5, "mixed_graph_distinct_batch");
+
         // Reorg has no learnable parameters and no randomness, so unlike dropout it fits the
         // exact CPU/GPU parity harness directly.
         std::vector<float> reorg_input(detector::Network::from_cfg((directory / "reorg-train.cfg").string()).input_shape().elements());

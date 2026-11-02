@@ -2,14 +2,18 @@
 #include "detector/image.hpp"
 #include "detector/trainer.hpp"
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
+#include <exception>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <random>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 namespace fs = std::filesystem;
@@ -50,6 +54,8 @@ struct Options {
     int multiscale_min = 0;
     int multiscale_max = 0;
     int multiscale_interval = 10;  // Darknet's default resize period, in batches
+    // Threads decoding/augmenting the next minibatch while the current one trains.
+    int loader_threads = static_cast<int>(std::clamp(std::thread::hardware_concurrency(), 2u, 17u)) - 1;
 };
 
 std::vector<int> int_list(const std::string& value) {
@@ -68,6 +74,8 @@ std::vector<float> float_list(const std::string& value) {
     return result;
 }
 
+// Parses and validates the `--key value` options after the four positional arguments; throws
+// std::runtime_error on an unknown key or an out-of-range value.
 Options options_from(int argc, char** argv) {
     Options options;
     for (int i = 5; i < argc; i += 2) {
@@ -97,6 +105,7 @@ Options options_from(int argc, char** argv) {
         else if (key == "--multiscale-min") options.multiscale_min = std::stoi(value);
         else if (key == "--multiscale-max") options.multiscale_max = std::stoi(value);
         else if (key == "--multiscale-interval") options.multiscale_interval = std::stoi(value);
+        else if (key == "--loader-threads") options.loader_threads = std::stoi(value);
         else throw std::runtime_error("unknown option: " + key);
     }
     if (options.epochs < 1 || options.epochs > 100000 || options.limit < 0)
@@ -135,6 +144,7 @@ Options options_from(int argc, char** argv) {
             throw std::runtime_error("--multiscale-min/--multiscale-max must be positive multiples of 32 with min <= max");
     }
     if (options.multiscale_interval < 1) throw std::runtime_error("invalid multiscale interval");
+    if (options.loader_threads < 1) throw std::runtime_error("--loader-threads must be at least 1");
     return options;
 }
 
@@ -187,13 +197,13 @@ void jitter_hsv(std::vector<float>& chw, const detector::Shape& shape, float hue
     }
 }
 
-// Picks a random crop rectangle within [0,width)x[0,height), shrinking each edge by up to
-// `jitter` times that dimension (Darknet's "jitter" aspect/scale augmentation, crop-only variant).
+// Turns pre-drawn per-edge crop fractions (left, right, top, bottom; each in [0, jitter)) into a
+// crop rectangle within [0,width)x[0,height) (Darknet's "jitter" aspect/scale augmentation,
+// crop-only variant).
 struct CropRect { int x0, y0, w, h; };
-CropRect random_crop_rect(int width, int height, float jitter, std::mt19937& rng) {
-    std::uniform_real_distribution<float> frac(0.0f, jitter);
-    int left = static_cast<int>(frac(rng) * width), right = static_cast<int>(frac(rng) * width);
-    int top = static_cast<int>(frac(rng) * height), bottom = static_cast<int>(frac(rng) * height);
+CropRect crop_rect_from(int width, int height, const std::array<float, 4>& fractions) {
+    int left = static_cast<int>(fractions[0] * width), right = static_cast<int>(fractions[1] * width);
+    int top = static_cast<int>(fractions[2] * height), bottom = static_cast<int>(fractions[3] * height);
     int w = std::max(1, width - left - right), h = std::max(1, height - top - bottom);
     left = std::min(left, width - w);
     top = std::min(top, height - h);
@@ -255,11 +265,89 @@ void letterbox_target(detector::Target& target, const detector::Letterbox& box, 
     target.height *= static_cast<float>(box.resized_height) / network_shape.h;
 }
 
+// One image's augmentation draws, taken on the planning thread in a fixed order so the number
+// of loader threads never changes which minibatches a given seed produces.
+struct SamplePlan {
+    fs::path image;
+    bool crop = false;
+    std::array<float, 4> crop_fractions{};  // left, right, top, bottom
+    bool flip = false;
+    bool color = false;
+    float hue = 0.0f, saturation = 1.0f, exposure = 1.0f;
+};
+
+// A minibatch's sample plans plus the network input shape its images are letterboxed to (the
+// shape changes between minibatches only under multiscale training).
+struct BatchPlan {
+    std::vector<SamplePlan> samples;
+    detector::Shape shape;
+};
+
+// A prepared minibatch, ready for Trainer/CudaTrainer::step().
+struct Batch {
+    std::vector<std::vector<float>> inputs;
+    std::vector<std::vector<detector::Target>> targets;
+    detector::Shape shape;
+};
+
+// Loads one image and its labels, then applies the planned crop, letterbox, flip and HSV jitter.
+// Touches no shared state, so samples can be prepared concurrently.
+void prepare_sample(const SamplePlan& plan, const fs::path& labels_dir, detector::Shape shape,
+                    std::vector<float>& input, std::vector<detector::Target>& labels) {
+    auto image = detector::read_image(plan.image.string());
+    labels = raw_labels_from(labels_dir / (plan.image.stem().string() + ".txt"));
+    if (plan.crop) {
+        int orig_w = image.width, orig_h = image.height;
+        auto rect = crop_rect_from(orig_w, orig_h, plan.crop_fractions);
+        image = detector::crop(image, rect.x0, rect.y0, rect.w, rect.h);
+        std::vector<detector::Target> kept;
+        for (auto label : labels) if (crop_target(label, rect, orig_w, orig_h)) kept.push_back(label);
+        labels = std::move(kept);
+    }
+    auto box = detector::letterbox(image, shape);
+    for (auto& label : labels) letterbox_target(label, box, shape);
+    if (plan.flip) {
+        flip_horizontal(box.chw, shape);
+        for (auto& label : labels) label.cx = 1.0f - label.cx;
+    }
+    if (plan.color) jitter_hsv(box.chw, shape, plan.hue, plan.saturation, plan.exposure);
+    input = std::move(box.chw);
+}
+
+// Prepares every sample of `plan` on up to `threads` threads (each fills a disjoint strided
+// subset of slots, so no locking); rethrows the first worker error after all threads join.
+Batch prepare_batch(const BatchPlan& plan, const fs::path& labels_dir, int threads) {
+    Batch batch;
+    const std::size_t n = plan.samples.size();
+    batch.inputs.resize(n);
+    batch.targets.resize(n);
+    batch.shape = plan.shape;
+    const std::size_t workers = std::max<std::size_t>(1, std::min<std::size_t>(static_cast<std::size_t>(threads), n));
+    std::vector<std::exception_ptr> errors(workers);
+    auto work = [&](std::size_t t) {
+        try {
+            for (std::size_t i = t; i < n; i += workers)
+                prepare_sample(plan.samples[i], labels_dir, plan.shape, batch.inputs[i], batch.targets[i]);
+        } catch (...) {
+            errors[t] = std::current_exception();
+        }
+    };
+    std::vector<std::thread> pool;
+    for (std::size_t t = 1; t < workers; ++t) pool.emplace_back(work, t);
+    work(0);
+    for (auto& thread : pool) thread.join();
+    for (const auto& error : errors) if (error) std::rethrow_exception(error);
+    return batch;
+}
+
 // Shared epoch loop for both Trainer (CPU) and CudaTrainer (GPU): same data pipeline (random
 // crop, letterbox, flip/HSV augmentation, labels), differing only in which trainer type steps
 // and whether its device-resident weights need syncing back to `network` before each checkpoint.
 // Samples are assembled into minibatches of `options.batch_size` (a smaller final batch per
 // epoch is fine) so step() computes true cross-sample batch-norm statistics, not per-sample ones.
+// The next minibatch is decoded/augmented on `options.loader_threads` threads while the current
+// one trains (Darknet's background load_data pattern); every random draw stays on this thread,
+// one minibatch ahead, so results are identical for any loader thread count.
 // `start_epoch` is the number of epochs already completed by a prior (crashed/interrupted) run
 // being resumed via --resume-from (0 for a fresh run); the loop continues toward the same
 // --epochs target total rather than restarting the epoch count from scratch. Per-epoch image
@@ -273,54 +361,57 @@ void train_loop(TrainerT& trainer, detector::Network& network, std::vector<fs::p
     std::uniform_real_distribution<float> exposure_dist(1.0f - options.exposure_jitter, 1.0f + options.exposure_jitter);
     std::uniform_real_distribution<float> saturation_dist(1.0f - options.saturation_jitter, 1.0f + options.saturation_jitter);
     std::uniform_real_distribution<float> hue_dist(-options.hue_jitter, options.hue_jitter);
+    std::uniform_real_distribution<float> crop_fraction(0.0f, options.crop_jitter);
+    const bool crop = options.crop_jitter > 0.0f;
+    const bool color = options.exposure_jitter > 0.0f || options.saturation_jitter > 0.0f || options.hue_jitter > 0.0f;
     // Multiscale resize-jitter: a single random multiple-of-32 dimension applied to both width
-    // and height (Darknet always resizes to a square), persisting across epochs since the batch
-    // counter below is declared once for the whole run, not reset per epoch.
-    bool multiscale = options.multiscale_max > 0;
+    // and height (Darknet always resizes to a square), redrawn every `multiscale_interval`
+    // minibatches across the whole run (the planned-batch counter is never reset per epoch).
+    const bool multiscale = options.multiscale_max > 0;
     std::uniform_int_distribution<int> multiscale_dist(options.multiscale_min / 32, options.multiscale_max / 32);
-    int batches_done = 0;
+    detector::Shape planned_shape = network.input_shape();
+    long long planned_batches = 0;
+    const std::size_t batch_size = static_cast<std::size_t>(options.batch_size);
+    auto plan_batch = [&](std::size_t begin) {
+        if (multiscale && planned_batches > 0 && planned_batches % options.multiscale_interval == 0)
+            planned_shape.w = planned_shape.h = multiscale_dist(rng) * 32;
+        ++planned_batches;
+        BatchPlan plan;
+        plan.shape = planned_shape;
+        for (std::size_t i = begin; i < std::min(images.size(), begin + batch_size); ++i) {
+            SamplePlan sample;
+            sample.image = images[i];
+            sample.crop = crop;
+            if (crop) for (auto& fraction : sample.crop_fractions) fraction = crop_fraction(rng);
+            sample.flip = flip_coin(rng);
+            sample.color = color;
+            if (color) {
+                sample.hue = hue_dist(rng);
+                sample.saturation = saturation_dist(rng);
+                sample.exposure = exposure_dist(rng);
+            }
+            plan.samples.push_back(std::move(sample));
+        }
+        return plan;
+    };
+    auto launch = [&](std::size_t begin) {
+        return std::async(std::launch::async, prepare_batch, plan_batch(begin), std::cref(labels_dir),
+                          options.loader_threads);
+    };
     for (int epoch = start_epoch + 1; epoch <= options.epochs; ++epoch) {
         std::shuffle(images.begin(), images.end(), rng);
         double loss_sum = 0;
         std::size_t positives = 0;
-        std::vector<std::vector<float>> batch_inputs;
-        std::vector<std::vector<detector::Target>> batch_targets;
-        auto flush_batch = [&] {
-            if (batch_inputs.empty()) return;
-            auto result = trainer.step(batch_inputs, batch_targets);
+        auto pending = launch(0);
+        for (std::size_t begin = 0; begin < images.size(); begin += batch_size) {
+            Batch batch = pending.get();
+            if (begin + batch_size < images.size()) pending = launch(begin + batch_size);
+            if (batch.shape.w != network.input_shape().w || batch.shape.h != network.input_shape().h)
+                trainer.resize(batch.shape.w, batch.shape.h);
+            auto result = trainer.step(batch.inputs, batch.targets);
             loss_sum += result.loss;
             positives += result.positives;
-            batch_inputs.clear();
-            batch_targets.clear();
-            if (multiscale && ++batches_done % options.multiscale_interval == 0) {
-                int dim = multiscale_dist(rng) * 32;
-                trainer.resize(dim, dim);
-            }
-        };
-        for (const auto& path : images) {
-            auto image = detector::read_image(path.string());
-            auto labels = raw_labels_from(labels_dir / (path.stem().string() + ".txt"));
-            if (options.crop_jitter > 0.0f) {
-                int orig_w = image.width, orig_h = image.height;
-                auto rect = random_crop_rect(orig_w, orig_h, options.crop_jitter, rng);
-                image = detector::crop(image, rect.x0, rect.y0, rect.w, rect.h);
-                std::vector<detector::Target> kept;
-                for (auto label : labels) if (crop_target(label, rect, orig_w, orig_h)) kept.push_back(label);
-                labels = std::move(kept);
-            }
-            auto box = detector::letterbox(image, network.input_shape());
-            for (auto& label : labels) letterbox_target(label, box, network.input_shape());
-            if (flip_coin(rng)) {
-                flip_horizontal(box.chw, network.input_shape());
-                for (auto& label : labels) label.cx = 1.0f - label.cx;
-            }
-            if (options.exposure_jitter > 0.0f || options.saturation_jitter > 0.0f || options.hue_jitter > 0.0f)
-                jitter_hsv(box.chw, network.input_shape(), hue_dist(rng), saturation_dist(rng), exposure_dist(rng));
-            batch_inputs.push_back(std::move(box.chw));
-            batch_targets.push_back(std::move(labels));
-            if (batch_inputs.size() >= static_cast<std::size_t>(options.batch_size)) flush_batch();
         }
-        flush_batch();  // final, possibly smaller, partial batch
         if (sync_before_checkpoint) trainer.sync_to_network();
         network.save_weights(output_path.string());
         // Sidecar "<iteration> <completed epochs>", read back by a later --resume-from run so the
@@ -352,6 +443,8 @@ std::vector<fs::path> images_from(const fs::path& directory) {
 
 }  // namespace
 
+// CLI entry point: builds the network, initializes or resumes weights, and trains on the CPU,
+// one GPU or several GPUs; returns 0 on success, 1 on error, 2 on a usage error.
 int main(int argc, char** argv) {
     try {
         if (argc < 5) {
@@ -361,7 +454,8 @@ int main(int argc, char** argv) {
                          "[--batch 1] [--burn-in 0] [--steps s1,s2,...] [--scales f1,f2,...] "
                          "[--flip-probability 0.0] [--exposure-jitter 0.0] [--saturation-jitter 0.0] "
                          "[--hue-jitter 0.0] [--crop-jitter 0.0] [--backend cpu|cuda] [--gpus 0,1] "
-                         "[--multiscale-min N] [--multiscale-max N] [--multiscale-interval 10]\n"
+                         "[--multiscale-min N] [--multiscale-max N] [--multiscale-interval 10] "
+                         "[--loader-threads N]\n"
                          "  --resume-from: full-loads <weights> and its sidecar \"<weights>.step\" (written "
                          "alongside every checkpoint save) to continue the LR schedule/epoch loop exactly, "
                          "instead of restarting it at iteration 0 like --init does; mutually exclusive with "
@@ -411,6 +505,7 @@ int main(int argc, char** argv) {
                   << " crop_jitter=" << options.crop_jitter << " momentum=" << options.momentum
                   << " multiscale_min=" << options.multiscale_min << " multiscale_max=" << options.multiscale_max
                    << " multiscale_interval=" << options.multiscale_interval
+                   << " loader_threads=" << options.loader_threads
                    << " gpu_count=" << (options.backend == "cuda" ? options.gpus.size() : 0) << "\n";
         if (options.backend == "cuda") {
 #ifdef DETECTOR_HAS_CUDA

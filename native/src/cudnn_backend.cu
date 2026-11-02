@@ -4,9 +4,12 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace detector {
 namespace {
@@ -28,6 +31,44 @@ struct Scoped {
     Handle handle = nullptr;
     ~Scoped() { if (handle) Destroy(handle); }
 };
+
+/** Largest workspace a benchmarked algorithm may need: 256 MiB or a quarter of free memory. */
+std::size_t workspace_budget() {
+    std::size_t free_bytes = 0, total_bytes = 0;
+    check(cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo");
+    return std::min<std::size_t>(std::size_t{256} << 20, free_bytes / 4);
+}
+
+/** Device-wide scratch shared by every convolution (layers run one at a time on one stream),
+ *  grown on demand; cudaFree synchronizes the device, so growth never frees a buffer an
+ *  in-flight convolution still reads. Kept for the process lifetime. */
+void* shared_workspace(std::size_t bytes) {
+    static std::mutex mutex;
+    static std::map<int, std::pair<void*, std::size_t>> by_device;
+    if (bytes == 0) return nullptr;
+    int device = 0;
+    check(cudaGetDevice(&device), "cudaGetDevice");
+    std::lock_guard<std::mutex> lock(mutex);
+    auto& entry = by_device[device];
+    if (entry.second < bytes) {
+        if (entry.first) check(cudaFree(entry.first), "cudaFree(cuDNN workspace)");
+        entry = {nullptr, 0};
+        check(cudaMalloc(&entry.first, bytes), "cudaMalloc(cuDNN workspace)");
+        entry.second = bytes;
+    }
+    return entry.first;
+}
+
+/** Fastest successful full-FP32 algorithm (cuDNN returns results sorted by measured time)
+ *  whose workspace fits `budget`; tensor-op (TF32/FP16) variants are excluded. */
+template <typename Perf>
+Perf fastest(const Perf* results, int count, std::size_t budget, const char* direction) {
+    for (int i = 0; i < count; ++i)
+        if (results[i].status == CUDNN_STATUS_SUCCESS && results[i].memory <= budget &&
+            results[i].mathType != CUDNN_TENSOR_OP_MATH && results[i].mathType != CUDNN_TENSOR_OP_MATH_ALLOW_CONVERSION)
+            return results[i];
+    throw std::runtime_error(std::string("no cuDNN ") + direction + " convolution algorithm fits the workspace budget");
+}
 
 }  // namespace
 
@@ -84,15 +125,25 @@ void cudnn_convolution_forward(const float* input, const float* weights, float* 
     check(status, "cudnnConvolutionForward");
 }
 
-/** Owns the descriptors and scratch space reused by convolution forward and backward. */
+/** Owns the descriptors and benchmarked algorithms reused by convolution forward and backward. */
 struct CudnnConvolution::Impl {
+    /** Algorithms measured fastest (cudnnFind*, like PyTorch's benchmark mode) for one batch size;
+     *  backward ones are found on first use so inference-only sessions never pay for them. */
+    struct Algorithms {
+        cudnnConvolutionFwdAlgo_t forward{};
+        std::size_t forward_bytes = 0;
+        bool backward_ready = false;
+        cudnnConvolutionBwdFilterAlgo_t filter{};
+        cudnnConvolutionBwdDataAlgo_t data{};
+        std::size_t filter_bytes = 0, data_bytes = 0;
+    };
     Scoped<cudnnHandle_t, cudnnDestroy> handle;
     Scoped<cudnnTensorDescriptor_t, cudnnDestroyTensorDescriptor> input;
     Scoped<cudnnTensorDescriptor_t, cudnnDestroyTensorDescriptor> output;
     Scoped<cudnnFilterDescriptor_t, cudnnDestroyFilterDescriptor> filter;
     Scoped<cudnnConvolutionDescriptor_t, cudnnDestroyConvolutionDescriptor> convolution;
-    void* workspace = nullptr;
-    std::size_t workspace_bytes = 0;
+    std::map<int, Algorithms> algorithms;  // keyed by minibatch size
+    Algorithms* active = nullptr;
     int in_channels, in_height, in_width, out_channels, out_height, out_width;
     int batch_size = 0;
 
@@ -117,10 +168,10 @@ struct CudnnConvolution::Impl {
               "cudnnSetConvolution2dDescriptor");
         check(cudnnSetConvolutionMathType(convolution.handle, CUDNN_FMA_MATH),
               "cudnnSetConvolutionMathType");
-        set_batch(1);
     }
 
-    /** Resizes only tensor descriptors and workspace when the active minibatch changes. */
+    /** Points the tensor descriptors at a minibatch of `n` and selects that size's algorithms,
+     *  benchmarking the forward algorithm the first time `n` is seen. */
     void set_batch(int n) {
         if (n < 1) throw std::runtime_error("invalid cuDNN convolution batch size");
         if (n == batch_size) return;
@@ -128,29 +179,44 @@ struct CudnnConvolution::Impl {
               n, in_channels, in_height, in_width), "cudnnSetTensor4dDescriptor(input)");
         check(cudnnSetTensor4dDescriptor(output.handle, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
               n, out_channels, out_height, out_width), "cudnnSetTensor4dDescriptor(output)");
-        std::size_t forward_bytes = 0, filter_bytes = 0, data_bytes = 0;
-        check(cudnnGetConvolutionForwardWorkspaceSize(handle.handle, input.handle, filter.handle,
-              convolution.handle, output.handle, CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM, &forward_bytes),
-              "cudnnGetConvolutionForwardWorkspaceSize");
-        check(cudnnGetConvolutionBackwardFilterWorkspaceSize(handle.handle, input.handle, output.handle,
-              convolution.handle, filter.handle, CUDNN_CONVOLUTION_BWD_FILTER_ALGO_0, &filter_bytes),
-              "cudnnGetConvolutionBackwardFilterWorkspaceSize");
-        check(cudnnGetConvolutionBackwardDataWorkspaceSize(handle.handle, filter.handle, output.handle,
-              convolution.handle, input.handle, CUDNN_CONVOLUTION_BWD_DATA_ALGO_0, &data_bytes),
-              "cudnnGetConvolutionBackwardDataWorkspaceSize");
-        std::size_t needed = std::max({forward_bytes, filter_bytes, data_bytes});
-        if (needed > workspace_bytes) {
-            void* replacement = nullptr;
-            check(cudaMalloc(&replacement, needed), "cudaMalloc(cuDNN workspace)");
-            if (workspace) cudaFree(workspace);
-            workspace = replacement;
-            workspace_bytes = needed;
-        }
         batch_size = n;
+        auto found = algorithms.find(n);
+        if (found == algorithms.end()) {
+            cudnnConvolutionFwdAlgoPerf_t results[CUDNN_CONVOLUTION_FWD_ALGO_COUNT];
+            int count = 0;
+            check(cudnnFindConvolutionForwardAlgorithm(handle.handle, input.handle, filter.handle,
+                  convolution.handle, output.handle, CUDNN_CONVOLUTION_FWD_ALGO_COUNT, &count, results),
+                  "cudnnFindConvolutionForwardAlgorithm");
+            const auto best = fastest(results, count, workspace_budget(), "forward");
+            Algorithms chosen;
+            chosen.forward = best.algo;
+            chosen.forward_bytes = best.memory;
+            found = algorithms.emplace(n, chosen).first;
+        }
+        active = &found->second;
     }
 
-    /** Releases the workspace after all cuDNN operations have completed. */
-    ~Impl() { if (workspace) cudaFree(workspace); }
+    /** Benchmarks the backward filter/data algorithms for the active batch size on first use. */
+    void prepare_backward() {
+        if (active->backward_ready) return;
+        const std::size_t budget = workspace_budget();
+        cudnnConvolutionBwdFilterAlgoPerf_t filters[CUDNN_CONVOLUTION_BWD_FILTER_ALGO_COUNT];
+        int count = 0;
+        check(cudnnFindConvolutionBackwardFilterAlgorithm(handle.handle, input.handle, output.handle,
+              convolution.handle, filter.handle, CUDNN_CONVOLUTION_BWD_FILTER_ALGO_COUNT, &count, filters),
+              "cudnnFindConvolutionBackwardFilterAlgorithm");
+        const auto best_filter = fastest(filters, count, budget, "backward-filter");
+        cudnnConvolutionBwdDataAlgoPerf_t datas[CUDNN_CONVOLUTION_BWD_DATA_ALGO_COUNT];
+        check(cudnnFindConvolutionBackwardDataAlgorithm(handle.handle, filter.handle, output.handle,
+              convolution.handle, input.handle, CUDNN_CONVOLUTION_BWD_DATA_ALGO_COUNT, &count, datas),
+              "cudnnFindConvolutionBackwardDataAlgorithm");
+        const auto best_data = fastest(datas, count, budget, "backward-data");
+        active->filter = best_filter.algo;
+        active->filter_bytes = best_filter.memory;
+        active->data = best_data.algo;
+        active->data_bytes = best_data.memory;
+        active->backward_ready = true;
+    }
 };
 
 CudnnConvolution::CudnnConvolution(int in_c, int in_h, int in_w, int out_c,
@@ -160,28 +226,33 @@ CudnnConvolution::~CudnnConvolution() = default;
 
 void CudnnConvolution::forward(const float* input, const float* weights, float* output, int n) {
     impl_->set_batch(n);
+    const auto& algorithms = *impl_->active;
     const float one = 1.0f, zero = 0.0f;
     check(cudnnConvolutionForward(impl_->handle.handle, &one, impl_->input.handle, input,
-          impl_->filter.handle, weights, impl_->convolution.handle,
-          CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM, impl_->workspace, impl_->workspace_bytes,
+          impl_->filter.handle, weights, impl_->convolution.handle, algorithms.forward,
+          shared_workspace(algorithms.forward_bytes), algorithms.forward_bytes,
           &zero, impl_->output.handle, output), "cudnnConvolutionForward");
 }
 
 void CudnnConvolution::backward_filter(const float* input, const float* dy, float* dw, int n) {
     impl_->set_batch(n);
+    impl_->prepare_backward();
+    const auto& algorithms = *impl_->active;
     const float one = 1.0f;
     check(cudnnConvolutionBackwardFilter(impl_->handle.handle, &one, impl_->input.handle, input,
-          impl_->output.handle, dy, impl_->convolution.handle, CUDNN_CONVOLUTION_BWD_FILTER_ALGO_0,
-          impl_->workspace, impl_->workspace_bytes, &one, impl_->filter.handle, dw),
+          impl_->output.handle, dy, impl_->convolution.handle, algorithms.filter,
+          shared_workspace(algorithms.filter_bytes), algorithms.filter_bytes, &one, impl_->filter.handle, dw),
           "cudnnConvolutionBackwardFilter");
 }
 
 void CudnnConvolution::backward_data(const float* weights, const float* dy, float* dx, int n) {
     impl_->set_batch(n);
+    impl_->prepare_backward();
+    const auto& algorithms = *impl_->active;
     const float one = 1.0f;
     check(cudnnConvolutionBackwardData(impl_->handle.handle, &one, impl_->filter.handle, weights,
-          impl_->output.handle, dy, impl_->convolution.handle, CUDNN_CONVOLUTION_BWD_DATA_ALGO_0,
-          impl_->workspace, impl_->workspace_bytes, &one, impl_->input.handle, dx),
+          impl_->output.handle, dy, impl_->convolution.handle, algorithms.data,
+          shared_workspace(algorithms.data_bytes), algorithms.data_bytes, &one, impl_->input.handle, dx),
           "cudnnConvolutionBackwardData");
 }
 

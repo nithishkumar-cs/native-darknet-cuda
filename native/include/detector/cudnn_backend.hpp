@@ -14,11 +14,10 @@ namespace detector {
 int cudnn_runtime_version();
 
 // Single-sample (N=1), NCHW, no-bias, square-kernel 2D convolution forward via
-// cudnnConvolutionForward - the same math as cuda_backend.cu's `convolution`
-// kernel before its multiplier/offset/leaky-activation epilogue (the caller
-// applies those separately, matching that kernel's split of concerns). Creates
-// and destroys its own handle/descriptors/workspace per call (correctness-first;
-// not yet optimized for repeated use in a hot loop - see the header comment above).
+// cudnnConvolutionForward - the same math as the cuBLAS build's im2col + SGEMM
+// convolution before its multiplier/offset/leaky-activation epilogue (the caller
+// applies those separately). Creates and destroys its own handle/descriptors/
+// workspace per call (a reference/test helper; hot loops use CudnnConvolution).
 // `weights` layout is [out_channels][in_channels][kernel][kernel], matching this
 // project's Darknet-format weight layout. Throws std::runtime_error on any cuDNN
 // or CUDA failure.
@@ -26,13 +25,15 @@ void cudnn_convolution_forward(const float* input, const float* weights, float* 
                                 int in_channels, int in_h, int in_w, int out_channels,
                                 int kernel, int stride, int pad);
 
-/** Caches cuDNN descriptors, handle and workspace for one convolution shape. */
+/** Caches cuDNN descriptors, handle and, per minibatch size, the forward/backward algorithms
+ *  measured fastest on this GPU (full FP32, workspace-bounded) for one convolution shape. Scratch
+ *  space is one device-wide buffer shared by all convolutions on the stream. */
 class CudnnConvolution {
 public:
     /** Prepares descriptors for one filter and spatial shape. */
     CudnnConvolution(int in_channels, int in_h, int in_w, int out_channels,
                      int kernel, int stride, int pad);
-    /** Releases the cuDNN descriptors and workspace. */
+    /** Releases the cuDNN descriptors. */
     ~CudnnConvolution();
     CudnnConvolution(const CudnnConvolution&) = delete;
     CudnnConvolution& operator=(const CudnnConvolution&) = delete;

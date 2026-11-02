@@ -2,6 +2,9 @@
 #include "detector/cuda_classifier_trainer.hpp"
 #include "detector/network.hpp"
 #include "detector/vector_dataset.hpp"
+#ifdef DETECTOR_HAS_TENSORRT
+#include "detector/trt_session.hpp"
+#endif
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
@@ -43,7 +46,8 @@ Options parse(int argc, char** argv) {
         else if (key == "--backend") options.backend = value;
         else throw std::runtime_error("unknown option: " + key);
     }
-    if (options.backend != "cpu" && options.backend != "cuda") throw std::runtime_error("backend must be cpu or cuda");
+    if (options.backend != "cpu" && options.backend != "cuda" && options.backend != "tensorrt")
+        throw std::runtime_error("backend must be cpu, cuda or tensorrt");
     if (options.epochs < 1 || options.limit < 0) throw std::runtime_error("invalid segmenter options");
     return options;
 }
@@ -53,7 +57,8 @@ void usage() {
     std::cerr << "Usage:\n"
               << "  cuda_segmenter train <cfg> <output.weights> <data.vecbin>"
                  " [--backend cpu|cuda] [--epochs N] [--lr 0.01] [--decay 0] [--seed 2026] [--limit N] [--init weights]\n"
-              << "  cuda_segmenter eval <cfg> <weights> <data.vecbin> [--limit N]\n"
+              << "  cuda_segmenter eval <cfg> <weights> <data.vecbin> [--limit N] [--backend tensorrt]\n"
+              << "    (with --backend tensorrt, <weights> is a Jetson-built TensorRT engine of the exported ONNX)\n"
               << "Each record: input CHW float32 pixels followed by H*W float32 integer class IDs.\n";
 }
 
@@ -81,6 +86,8 @@ int main(int argc, char** argv) {
         const std::size_t count = options.limit > 0 ?
             std::min(data.size(), static_cast<std::size_t>(options.limit)) : data.size();
         const std::string weights = argv[3];
+        if (options.backend == "tensorrt" && command == "train")
+            throw std::runtime_error("tensorrt backend is eval-only");
         if (command == "train") {
             if (std::filesystem::exists(weights))
                 throw std::runtime_error("refusing to overwrite existing output weights");
@@ -123,13 +130,25 @@ int main(int argc, char** argv) {
             }
         } else {
             if (!options.initial_weights.empty()) throw std::runtime_error("--init is train-only");
-            network.load_weights(weights);
+#ifdef DETECTOR_HAS_TENSORRT
+            std::unique_ptr<detector::TrtSession> trt;
+            if (options.backend == "tensorrt") trt = std::make_unique<detector::TrtSession>(network, weights);
+#else
+            if (options.backend == "tensorrt")
+                throw std::runtime_error("TensorRT backend not built; use -DDETECTOR_TENSORRT=ON");
+#endif
+            if (options.backend != "tensorrt") network.load_weights(weights);
             std::vector<std::size_t> intersection(static_cast<std::size_t>(shape.c), 0);
             std::vector<std::size_t> union_count(static_cast<std::size_t>(shape.c), 0);
             std::size_t correct = 0;
             std::size_t labeled_pixels = 0;
             for (std::size_t i = 0; i < count; ++i) {
+#ifdef DETECTOR_HAS_TENSORRT
+                auto heads = trt ? trt->forward(data.input(i))
+                                 : network.forward(data.input(i), detector::Backend::cpu);
+#else
                 auto heads = network.forward(data.input(i), detector::Backend::cpu);
+#endif
                 if (heads.empty() || heads.back().values.size() != shape.elements())
                     throw std::runtime_error("segmentation head output missing");
                 const auto& logits = heads.back().values;

@@ -76,13 +76,24 @@ struct TrtSession::Impl {
     float* input_device = nullptr;
     std::vector<float*> head_devices;
     std::vector<std::pair<std::size_t, Shape>> heads;
+    std::vector<std::string> head_names;
 
     Impl(const Network& network, const std::string& path) {
         for (std::size_t index = 0; index < network.layers().size(); ++index)
             if (network.layers()[index].kind == Kind::yolo || network.layers()[index].kind == Kind::region)
                 heads.emplace_back(index, network.layers()[index].output);
-        if (heads.empty())
-            throw std::runtime_error("TensorRT backend expects at least one [yolo]/[region] head");
+        if (!heads.empty()) {
+            for (std::size_t index = 0; index < heads.size(); ++index)
+                head_names.push_back("head_" + std::to_string(index));
+        } else {
+            // Dense-prediction cfg (segmentation): single "logits" output from the last layer.
+            if (network.layers().empty() ||
+                (network.layers().back().kind != Kind::convolutional &&
+                 network.layers().back().kind != Kind::deconvolutional))
+                throw std::runtime_error("TensorRT backend expects a [yolo]/[region] head or a convolutional/deconvolutional final layer");
+            heads.emplace_back(network.layers().size() - 1, network.layers().back().output);
+            head_names.push_back("logits");
+        }
         auto data = read_engine(path);
         runtime.reset(nvinfer1::createInferRuntime(logger));
         if (!runtime) throw std::runtime_error("TensorRT runtime creation failed");
@@ -92,8 +103,7 @@ struct TrtSession::Impl {
             throw std::runtime_error("TensorRT engine must have one input and one raw head output per [yolo]/[region] layer");
         expect_tensor(*engine, "images", nvinfer1::TensorIOMode::kINPUT, network.input_shape());
         for (std::size_t index = 0; index < heads.size(); ++index) {
-            auto name = std::string("head_") + std::to_string(index);
-            expect_tensor(*engine, name.c_str(), nvinfer1::TensorIOMode::kOUTPUT, heads[index].second);
+            expect_tensor(*engine, head_names[index].c_str(), nvinfer1::TensorIOMode::kOUTPUT, heads[index].second);
         }
         context.reset(engine->createExecutionContext());
         if (!context) throw std::runtime_error("TensorRT execution context creation failed");
@@ -101,7 +111,7 @@ struct TrtSession::Impl {
         if (!context->setTensorAddress("images", input_device))
             throw std::runtime_error("TensorRT input binding failed");
         for (std::size_t index = 0; index < heads.size(); ++index) {
-            auto name = std::string("head_") + std::to_string(index);
+            const auto& name = head_names[index];
             auto* pointer = memory.floats(heads[index].second.elements());
             head_devices.push_back(pointer);
             if (!context->setTensorAddress(name.c_str(), pointer))

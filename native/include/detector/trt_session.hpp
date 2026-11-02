@@ -9,7 +9,8 @@ namespace detector {
 
 // A Jetson-built TensorRT plan with the same raw YOLO/region head outputs (one
 // per [yolo]/[region] layer in the network, in layer order) as the ONNX
-// exporter. Preprocessing and decode/NMS remain in detector_core.
+// exporter; a cfg with no such layer that ends in a (de)convolutional layer
+// (segmentation) maps to the single "logits" output. Preprocessing and decode/NMS remain in detector_core.
 class TrtSession {
 public:
     TrtSession(const Network& network, const std::string& engine_path);

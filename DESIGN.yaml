@@ -95,6 +95,16 @@ todo:
   - item: "[req-66] let's do 1,4,5,6 (open request; full text: lean req show 66)"
   - item: "[req-65] - Is there a specific next feature/retrain you want started now, or should the current backlog (RNN wiring, multi-GPU, cuDNN, three architectures trained/evalua… (open request; full text: lean req show 65)"
   - item: "Keep docs/engineering-log.md (resume/interview reference: milestones, measured results, bugs found/fixed, skills demonstrated) up to date as new milestones land - generated 2026-10-22 from git log + DESIGN.yaml, not from raw chat transcripts (those are not available as files across sessions)."
+  - item: >-
+      [req-10] Resume bullets for this project (now native-darknet-cuda, far
+      beyond the original single-model CNN) drafted in chat on 2026-11-02 for
+      user review; not yet added anywhere. The resume file itself (s.tex) is
+      outside this repo, in D:\Projects\R, whose "C++/CUDA CNN Training
+      Framework" project block is stale and needs replacing once the user
+      approves wording. The mAP@0.5 figures used are this project's own
+      converted-VOC-labels evaluator (confidence 0.01, class-aware NMS 0.45,
+      no-difficult-objects), not an official VOC/COCO leaderboard score - any
+      resume wording must not imply otherwise.
   - item: "Consider a same-evaluator external-Darknet YOLOv2 baseline run for a true fidelity comparison, matching how the YOLOv3-tiny checkpoint was benchmarked against pjreddie/darknet's own weights (not yet done; lower priority than other open items)."
   - item: If a YOLOv8n/Ultralytics comparison baseline is later published or distributed, resolve its AGPL-3.0 licensing first; this baseline is not part of the current native worktree.
   - item: Keep MNIST classifier and YOLOv3-tiny evaluation baselines as regressions while expanding the framework beyond one detector architecture.

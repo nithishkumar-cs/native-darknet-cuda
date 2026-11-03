@@ -41,9 +41,12 @@ if(DETECTOR_CUDNN)
   target_compile_definitions(detector_core PUBLIC DETECTOR_HAS_CUDNN=1)
   # cuDNN's DLLs (staged under CUDNN_ROOT/bin, not on system PATH like the CUDA
   # Toolkit's own DLLs) must sit next to any executable that loads them at runtime.
+  # Linux/Jetson system installs have none and resolve libcudnn.so normally.
   file(GLOB CUDNN_DLLS "${CUDNN_ROOT}/bin/*.dll")
-  add_custom_command(TARGET detector_core POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CUDNN_DLLS} "$<TARGET_FILE_DIR:detector_core>")
+  if(CUDNN_DLLS)
+    add_custom_command(TARGET detector_core POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CUDNN_DLLS} "$<TARGET_FILE_DIR:detector_core>")
+  endif()
 endif()
 
 if(DETECTOR_TENSORRT)

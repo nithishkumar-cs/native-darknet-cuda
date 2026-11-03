@@ -23,7 +23,7 @@ The evaluated ONNX file had SHA-256 `692ba3711c1b92c49266ee574ee936fb045891f61c0
 | TensorRT FP32 | 0.60016 | 0.58103 | 6.386 ms | 19.083 ms |
 | TensorRT FP16 | 0.59888 | 0.58066 | 3.742 ms | 12.216 ms |
 
-Timing used five warmups and 30 measured iterations on the same test image in the board's existing power mode. Network timing includes transfer and synchronization; pipeline timing adds in-memory preprocessing and decode/NMS. Both exclude file I/O and model setup. The slight mAP differences are numerical/backend variation. The laptop native CUDA checkpoint scored 0.59801 validation / 0.58182 test with PPM inputs; Jetson evaluated JPEG inputs. These are this project's AP@0.5 calculations, not official VOC leaderboard scores.
+Timing used five warmups and 30 measured iterations on the same test image in the board's existing power mode. The 2026-11-02 native CUDA convolution rewrite cut the native network mean from 91.138 ms to 13.4 ms (cuBLAS) or 8.8 ms (cuDNN), with validation mAP unchanged at 0.60006. [performance.md](performance.md) compares all backends against original Darknet using one protocol. Network timing includes transfer and synchronization; pipeline timing adds in-memory preprocessing and decode/NMS. Both exclude file I/O and model setup. The slight mAP differences are numerical/backend variation. The laptop native CUDA checkpoint scored 0.59801 validation / 0.58182 test with PPM inputs; Jetson evaluated JPEG inputs. These are this project's AP@0.5 calculations, not official VOC leaderboard scores.
 
 ## Historical external-Darknet checkpoint
 

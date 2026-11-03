@@ -5,7 +5,7 @@ the git history and `DESIGN.yaml`. Use this to recall talking points for a resum
 interview; it is not re-derived automatically, so re-run `git log` / check `DESIGN.yaml` for
 anything after the date below.
 
-Generated: 2026-10-22.
+Generated: 2026-10-22; last updated 2026-11-02.
 
 ## Project in one line
 
@@ -264,6 +264,31 @@ YOLO inference path.
   pipeline checks, not model quality. No full VOC training, held-out IoU/AP, or Jetson mask
   benchmark is claimed.
 
+**2026-11-02 — Faster than original Darknet on the same hardware.** These are head-to-head
+measurements against unmodified pjreddie Darknet (`GPU=1 CUDNN=0`, which is its only GPU build
+that compiles against current cuDNN). Method and tables: [performance.md](performance.md).
+- Training on the laptop RTX 3070 Ti used the same cfg, batch and 416 input, with comparable
+  clocks. Darknet against this framework's cuDNN build, in img/s: 129.7 vs 330.8 for
+  YOLOv3-tiny (2.55x), 40.4 vs 71.4 for YOLOv2 (1.77x), and 18.2 vs 30.5 for YOLOv3 (1.68x).
+  The default cuBLAS build uses the same algorithm as Darknet and ran 1.06-1.24x faster.
+- Changes driven by Nsight Systems traces: the next minibatch is now prepared on loader threads,
+  where GPU utilization had been 30-44% while the training thread decoded images. Uploads use
+  pinned memory and a second stream overlapping the previous backward pass. Each layer launches
+  once per minibatch instead of once per sample, and the YOLO loss runs on worker threads. cuDNN
+  algorithms are benchmarked per shape (they had been hard-coded to `IMPLICIT_GEMM` and
+  `ALGO_0`) and share one workspace. Pre-activation buffers were dropped.
+- On the full YOLOv3-tiny VOC schedule (about 320K images), this framework took 24.0 min and
+  Darknet took 48.7 min on the same laptop, the same day. Test mAP@0.5 was 0.580 for this
+  framework against 0.566 for Darknet; validation was 0.595 against 0.580.
+- Training memory was 12-15% lower than Darknet's in the cuBLAS build, and the same or lower
+  in the cuDNN build. Algorithm search moved to `cudnnFind*Ex` inside a capped shared
+  workspace; plain `cudnnFind*` had briefly pushed training to 7.9 GB.
+- Inference on the Jetson Orin Nano (25 W) used the same timer protocol for both frameworks.
+  Native cuDNN took 8.8 / 44.1 / 75.0 ms against Darknet's 15.1 / 55.7 / 116.3 ms
+  (1.3-1.7x faster). TensorRT FP16 took 3.8 / 6.8 / 9.9 ms (4.0-11.7x faster). The native
+  CUDA convolution moved from a direct per-pixel kernel to im2col + SGEMM with a fused
+  BN/leaky epilogue, which is 7-12x faster than before. Jetson validation mAP was unchanged.
+
 ## Bugs found and fixed (debugging skills, concrete)
 
 1. **CUDA buffer overrun** — missing thread-bounds check in batch-norm kernels corrupted
@@ -286,6 +311,11 @@ YOLO inference path.
  7. **Missing CUDA raw terminal output** — CPU inference exposed the final plain convolution/connected
     tensor for regressor/tag-style heads, but CUDA inference returned no head. The instance-mask
     CPU/CUDA projection test exposed it; the CUDA runner now downloads the final raw tensor too.
+ 8. **Silent spill into shared GPU memory** — YOLOv3 batch-8 training used 7.9 of 8 GB. A 17 MB
+    second input buffer added for upload overlap tipped it into Windows' shared-memory fallback,
+    and throughput fell from 15 to 5 img/s with no error. A batch-6 control run confirmed the
+    cause. Fixed by deriving the leaky-ReLU derivative from the activated output and storing no
+    pre-activation copies, which brought training down to 6.2 GB.
 
 ## Methodology/skills demonstrated
 
@@ -305,3 +335,7 @@ YOLO inference path.
   details that materially change accuracy.
 - GPU backend changes validated at several scales: independent convolution sums, CPU/CUDA
   parameter parity, a real 320-image throughput pilot, and same-evaluator full validation mAP.
+- Same-hardware benchmarking against the original implementation. Both frameworks used the same
+  cfgs, batches and timer scope. The thermally throttled laptop was cooled before each run, and
+  mean SM clock was recorded beside every number. Rounds with mismatched clocks were excluded
+  rather than reported.

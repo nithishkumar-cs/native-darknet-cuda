@@ -14,6 +14,8 @@ Three detector architectures have been trained end to end by this framework on V
 
 These are this project's all-point AP calculations on converted VOC labels excluding difficult objects, not official VOC leaderboard scores. The earlier **external-Darknet** YOLOv3-tiny checkpoint remains a historical comparison (0.57612 validation / 0.55534 test with the comparable native evaluator); it is not evidence of native training. Checkpoints, datasets and run logs are local ignored artifacts. The corrected native YOLOv3-tiny checkpoint was evaluated on Jetson with native CUDA and optional TensorRT FP32/FP16; see [Jetson results](docs/onnx-tensorrt.md).
 
+Against unmodified original Darknet on the same hardware (see [performance.md](docs/performance.md)), the cuDNN build trains YOLOv3-tiny / YOLOv2 / YOLOv3 2.55x / 1.77x / 1.68x faster on an RTX 3070 Ti laptop GPU. It finished the full YOLOv3-tiny VOC schedule in 24.0 min, against 48.7 min for Darknet, at 0.580 versus 0.566 test mAP@0.5. On a Jetson Orin Nano, native CUDA inference is 1.3-1.7x faster than Darknet, and the TensorRT FP16 export path is 4.0-11.7x faster.
+
 Build on Jetson Orin with CUDA and OpenCV development libraries:
 
 ```sh

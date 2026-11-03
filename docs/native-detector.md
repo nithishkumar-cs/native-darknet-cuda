@@ -47,6 +47,12 @@ The experimental trainer expects flat image directories and matching YOLO text-l
 
 ## Jetson inference validation
 
+> The native CUDA timings in this section predate the 2026-11-02 rewrite. They came from a
+> direct per-output-pixel convolution kernel; the current im2col + cuBLAS SGEMM path runs this
+> network in 13.4 ms, or 8.8 ms with cuDNN. The same-protocol Darknet comparison is in
+> [performance.md](performance.md). Darknet's `network_predict` timer, cited below, measured
+> cold single runs, not warm iterations.
+
 The board was an NVIDIA Jetson Orin, JetPack R36.5.0, CUDA 12.6.68, OpenCV 4.8, in its existing 25W power mode. The native detector was built in Release for CUDA architecture 87 with OpenCV. With the unmodified upstream YOLOv3-tiny configuration and official matching COCO weights, native CPU and CUDA produced one `person` detection at score 0.4172 on a held-out VOC2007 test image; original Darknet CPU/GPU reported `person: 40%`. This is approximate visible-detection agreement, **not** layer-by-layer or raw-tensor parity proof.
 
 Native CUDA timing with that pretrained COCO model, five warmups and 30 measured iterations at 416x416:

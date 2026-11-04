@@ -289,6 +289,22 @@ that compiles against current cuDNN). Method and tables: [performance.md](perfor
   CUDA convolution moved from a direct per-pixel kernel to im2col + SGEMM with a fused
   BN/leaky epilogue, which is 7-12x faster than before. Jetson validation mAP was unchanged.
 
+**2026-11-03 — Same-GPU comparison with PyTorch.** Wrote a matched PyTorch 2.11 version of the
+training job (`native/tools/pytorch_baseline.py`). It uses the same cfg graph, Darknet weights,
+loss, augmentation, optimizer and schedule. Before any timing, it was checked against this
+framework: forward outputs match, the one-step loss matches, and parameter updates agree within
+0.33%. Method and tables: [performance.md](performance.md).
+- Training throughput from a cooled GPU, in img/s, native cuDNN FP32 against PyTorch FP32:
+  333.7 vs 295.6 for YOLOv3-tiny (1.13x), 70.1 vs 55.7 for YOLOv2 (1.26x), and 27.6 vs 27.1
+  for YOLOv3 (1.02x). This framework is FP32-only. PyTorch's default TF32 tensor-core path is
+  even on YOLOv3-tiny and 1.2-1.4x faster on the other two; mixed precision is 1.3-2.2x faster.
+- Laptop batch-1 inference: native 2.10 / 7.52 / 13.52 ms against PyTorch FP32's
+  2.25 / 8.61 / 15.09 ms (1.07-1.15x). PyTorch FP16 is faster, at 1.92 / 5.03 / 7.25 ms.
+- On the full YOLOv3-tiny schedule, run as two alternating pairs on a heat-soaked laptop,
+  PyTorch FP32 took 23.3-23.5 min and native took 26.1-31.1 min. Accuracy was the same, with
+  test mAP@0.5 of 0.577-0.581. Native throttled harder under sustained load (323 vs 901 MHz mean
+  in one pair), and the cause is not yet isolated.
+
 ## Bugs found and fixed (debugging skills, concrete)
 
 1. **CUDA buffer overrun** — missing thread-bounds check in batch-norm kernels corrupted

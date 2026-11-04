@@ -1,10 +1,10 @@
-"""Same-GPU training-throughput benchmark: native cuda_detector_train vs original pjreddie Darknet.
+"""Same-GPU training-throughput benchmark: native cuda_detector_train vs original pjreddie Darknet and PyTorch.
 
-Both sides train the same cfg at a fixed input size with the same per-step minibatch, real VOC2007
+All sides train the same cfg at a fixed input size with the same per-step minibatch, real VOC2007
 images and comparable crop/flip/HSV augmentation. Throughput is steady-state wall-clock images/s:
-native = images per epoch / time between consecutive epoch checkpoints (epoch 1 is warm-up);
-Darknet (in the `darknet-train:gpu` Docker image, subdivisions=1, random=0) = images between two
-iteration lines. GPU temperature/clock/power/utilization (nvidia-smi, 1 s) are summarized over the
+native and PyTorch (native/tools/pytorch_baseline.py, same CLI, run by `--python`) = images per
+epoch / time between consecutive epoch checkpoints (epoch 1 is warm-up); Darknet (in the
+`darknet-train:gpu` Docker image, subdivisions=1, random=0) = images between two iteration lines. GPU temperature/clock/power/utilization (nvidia-smi, 1 s) are summarized over the
 measured window so throttling is visible; `--cool-to` waits for a cool GPU before starting.
 Each run appends one JSON line to `--results`. Data/weights paths follow docs/performance.md.
 """
@@ -90,12 +90,14 @@ def run_streaming(cmd, log_path, line_hook):
 
 
 def native(args, model):
-    """Times native training epochs; returns per-epoch images/s and the measured window bounds."""
+    """Times native or PyTorch training epochs; returns per-epoch images/s and the measured window bounds."""
     out = WORK / "out" / f"{args.label}.weights"
     out.parent.mkdir(parents=True, exist_ok=True)
     for stale in (out, Path(str(out) + ".step")):
         stale.unlink(missing_ok=True)
-    cmd = [str(ROOT / args.exe), model["cfg"], "runs/ppm/train", "data/voc2007/yolo/labels/train", str(out),
+    trainer = ([args.python, str(ROOT / "native/tools/pytorch_baseline.py"), "train"] if args.side == "pytorch"
+               else [str(ROOT / args.exe)])
+    cmd = trainer + [model["cfg"], "runs/ppm/train", "data/voc2007/yolo/labels/train", str(out),
            "--init", model["init"], "--init-layers", str(model["init_layers"]),
            "--epochs", str(args.epochs), "--limit", str(args.images), "--batch", str(args.batch),
            "--lr", "0.0001", "--burn-in", "1000", "--momentum", "0.9", "--seed", "7",
@@ -126,7 +128,7 @@ def native(args, model):
     watcher.join()
     if rc != 0 or len(marks) < 2:
         raise SystemExit(f"native run failed rc={rc} epochs={len(marks)}")
-    return [args.images / (b - a) for a, b in zip(marks, marks[1:])], marks[0], marks[-1]
+    return [args.images / (b - a) for a, b in zip(marks, marks[1:])], marks
 
 
 def darknet_cfg(src, dst, batch, max_batches):
@@ -153,7 +155,7 @@ ITER = re.compile(r"^(\d+): [-\d.naif]+, [-\d.naif]+ avg, [\d.e-]+ rate, ([\d.]+
 
 
 def darknet(args, model):
-    """Times original Darknet training iterations in Docker; returns images/s and window bounds."""
+    """Times original Darknet training iterations in Docker; returns images/s and the window's bounds."""
     work = WORK / "darknet"
     work.mkdir(parents=True, exist_ok=True)
     cfg = work / f"{args.label}.cfg"
@@ -179,37 +181,41 @@ def darknet(args, model):
     lo, hi = args.window
     if rc != 0 or lo not in iters or hi not in iters:
         raise SystemExit(f"darknet run failed rc={rc} last={max(iters) if iters else None}")
-    return [(hi - lo) * args.batch / (iters[hi] - iters[lo])], iters[lo], iters[hi]
+    return [(hi - lo) * args.batch / (iters[hi] - iters[lo])], [iters[lo], iters[hi]]
 
 
 def main():
     """Parses CLI options, runs one benchmark with telemetry and appends a JSON result line."""
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("side", choices=["native", "darknet"])
+    p.add_argument("side", choices=["native", "pytorch", "darknet"])
     p.add_argument("model", choices=sorted(MODELS))
     p.add_argument("--label", required=True)
     p.add_argument("--batch", type=int, required=True)
-    p.add_argument("--images", type=int, default=1024, help="native: images per epoch")
-    p.add_argument("--epochs", type=int, default=4, help="native: epochs (the first is warm-up)")
+    p.add_argument("--images", type=int, default=1024, help="native/pytorch: images per epoch")
+    p.add_argument("--epochs", type=int, default=4, help="native/pytorch: epochs (the first is warm-up)")
     p.add_argument("--exe", default=f"build/cuda_detector_train{EXE}")
+    p.add_argument("--python", default=sys.executable, help="pytorch: interpreter with CUDA PyTorch")
     p.add_argument("--iters", type=int, default=200, help="darknet: max_batches")
     p.add_argument("--window", type=int, nargs=2, default=[20, 190], help="darknet: measured iterations")
     p.add_argument("--image", default="darknet-train:gpu")
     p.add_argument("--cool-to", type=int, default=0, help="wait until the GPU is at or below this many C")
     p.add_argument("--results", default=str(WORK / "training.jsonl"))
-    p.add_argument("--extra", nargs=argparse.REMAINDER, default=[], help="extra native trainer flags")
+    p.add_argument("--extra", nargs=argparse.REMAINDER, default=[], help="extra native/pytorch trainer flags")
     args = p.parse_args()
     (WORK / "logs").mkdir(parents=True, exist_ok=True)
     while args.cool_to and gpu_temperature() > args.cool_to:
         time.sleep(5)
     telemetry = Telemetry()
     try:
-        rates, t0, t1 = native(args, MODELS[args.model]) if args.side == "native" else darknet(args, MODELS[args.model])
+        rates, marks = darknet(args, MODELS[args.model]) if args.side == "darknet" else native(args, MODELS[args.model])
     finally:
         telemetry.stop()
-    record = {"label": args.label, "side": args.side, "model": args.model, "batch": args.batch,
+    # Laptop clocks cannot be locked, so each window's mean SM clock is kept for clock-matched comparisons.
+    window_mhz = [round(telemetry.window(a, b).get("sm_mhz_mean", 0.0)) for a, b in zip(marks, marks[1:])]
+    record = {"label": args.label, "side": args.side, "model": args.model, "batch": args.batch, "extra": args.extra,
               "images_per_s": round(statistics.mean(rates), 2), "per_window": [round(r, 2) for r in rates],
-              "gpu": telemetry.window(t0, t1), "time": time.strftime("%Y-%m-%d %H:%M:%S")}
+              "per_window_sm_mhz": window_mhz, "gpu": telemetry.window(marks[0], marks[-1]),
+              "time": time.strftime("%Y-%m-%d %H:%M:%S")}
     print(json.dumps(record))
     with open(args.results, "a", encoding="utf-8") as f:
         f.write(json.dumps(record) + "\n")

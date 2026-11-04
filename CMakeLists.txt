@@ -210,6 +210,14 @@ if(BUILD_TESTING)
     if(ONNX_TEST_IMPORT_RESULT EQUAL 0)
       add_test(NAME darknet_onnx_export
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/native/tests/test_export_darknet_onnx.py)
+      execute_process(
+        COMMAND ${Python3_EXECUTABLE} -c "import torch"
+        RESULT_VARIABLE TORCH_TEST_IMPORT_RESULT
+        OUTPUT_QUIET ERROR_QUIET)
+      if(TORCH_TEST_IMPORT_RESULT EQUAL 0)
+        add_test(NAME pytorch_baseline_parity
+          COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/native/tests/test_pytorch_baseline.py)
+      endif()
     endif()
   endif()
 endif()
